@@ -9,9 +9,9 @@ Python port of the design of github.com/ericc-ch/copilot-api, with these additio
   * tool calls are buffered per index and emitted as complete blocks, so argument
     deltas can never land on a closed block;
   * `--manual` approval prompts are serialised with one lock;
-  * default models come from the live /models catalog, printed as the current
-    Claude Code variables (ANTHROPIC_DEFAULT_*_MODEL);
-  * an unknown model re-fetches the catalog and falls back to a real chat model;
+  * only the three Claude 5.5 models by default, every request mapped by family and printed as the
+    Claude Code variables (ANTHROPIC_DEFAULT_*_MODEL); with --any-model the live /models catalog, where an
+    unknown model re-fetches the catalog and falls back to a real chat model;
   * an existing Copilot editor login (~/.config/github-copilot/apps.json) is reused;
   * Claude models go through Copilot's native /v1/messages (prompt cache kept), with exact count_tokens and
     stepped server-side context editing;
@@ -79,8 +79,10 @@ GITHUB_API_VERSION = os.environ.get("COPILOT_PROXY_GITHUB_API_VERSION", "2025-04
 COPILOT_API_VERSION = os.environ.get("COPILOT_PROXY_COPILOT_API_VERSION", "2026-08-01")  # api.*.githubcopilot.com
 COPILOT_INTENT = "conversation-panel"
 
-# Default Claude models (Claude 5.5 family), used when the account's /models lists them; otherwise the newest
-# listed version of the family. Override with COPILOT_PROXY_DEFAULT_{SONNET,OPUS,HAIKU} or -m / -s.
+# The Claude models this proxy offers and uses (Claude 5.5 family). By default every request is mapped to one of
+# these three by family (opus / sonnet / haiku; anything else -> sonnet) and /v1/models lists only them.
+# --any-model (COPILOT_PROXY_ANY_MODEL=1) restores the full Copilot catalog, where these are the preferred defaults
+# and the newest listed version of the family is the fallback. Override with COPILOT_PROXY_DEFAULT_{SONNET,OPUS,HAIKU}.
 PREFERRED_MODELS = {
     "sonnet": os.environ.get("COPILOT_PROXY_DEFAULT_SONNET", "claude-sonnet-5.5"),
     "opus": os.environ.get("COPILOT_PROXY_DEFAULT_OPUS", "claude-opus-5.5"),
@@ -567,8 +569,15 @@ def _version_key(model_id: str) -> tuple:
 
 
 class ModelCatalog:
-    def __init__(self, tm: TokenManager, primary: Optional[str] = None, small: Optional[str] = None):
+    def __init__(self, tm: TokenManager, primary: Optional[str] = None, small: Optional[str] = None,
+                 any_model: bool = False):
         self.tm = tm
+        self.only: Optional[dict[str, str]] = None if any_model else dict(PREFERRED_MODELS)
+        if self.only:  # -m / -s must name one of the three; map by family
+            for name in (primary, small):
+                if name and not self.family_id(name):
+                    raise SystemExit(f"{name}: only {', '.join(self.only.values())} are enabled (see --any-model)")
+            primary, small = self.family_id(primary), self.family_id(small)
         self.primary = primary
         self.small = small
         self._lock = threading.Lock()
@@ -578,8 +587,20 @@ class ModelCatalog:
 
     def get_models_payload(self, force: bool = False) -> dict[str, Any]:
         with self._lock:
-            if not force and self._models and time.time() - self._fetched < 300:
-                return self._payload
+            fresh = not force and self._models and time.time() - self._fetched < 300
+        if not fresh:
+            self._fetch()
+        with self._lock:
+            payload = self._payload
+            models = dict(self._models)
+        if not self.only:
+            return payload
+        # only the three enabled models; one Copilot does not list yet gets a minimal entry
+        data = [models.get(mid) or {"id": mid, "object": "model", "name": mid, "vendor": "Anthropic"}
+                for mid in self.only.values()]
+        return {**payload, "data": data}
+
+    def _fetch(self) -> None:
         token, base = self.tm.get_token()
         status, _, data = http_json_request(
             "GET", f"{base}/models", headers=self.tm.copilot_headers(token), timeout=CONNECT_TIMEOUT
@@ -597,8 +618,22 @@ class ModelCatalog:
             LOG.info("Loaded %d Copilot models", len(self._models))
         else:
             LOG.warning("Cannot fetch Copilot models (%s): %s", status, str(data)[:300])
-        with self._lock:
-            return self._payload
+
+    def family_id(self, name: Optional[str]) -> Optional[str]:
+        """The enabled model for a name's family (opus / sonnet / haiku), or None."""
+        low = (name or "").lower()
+        if self.only:
+            if low in self.only.values():
+                return low
+            for fam in ("opus", "sonnet", "haiku"):
+                if fam in low:
+                    return self.only[fam]
+        return None
+
+    def missing(self) -> list[str]:
+        """Enabled models that this account's Copilot catalog does not list."""
+        ids = set(self.chat_model_ids())
+        return [m for m in (self.only or {}).values() if m not in ids]
 
     def chat_model_ids(self) -> list[str]:
         with self._lock:
@@ -612,6 +647,8 @@ class ModelCatalog:
     def newest(self, family: str) -> Optional[str]:
         """Default model for a family: the preferred Claude 5.5 id when this account's catalog serves it,
         otherwise the newest version Copilot lists (e.g. legacy annual plans, which get no new models)."""
+        if self.only:
+            return self.only.get(family)
         ids = [m for m in self.chat_model_ids() if m.startswith("claude") and family in m]
         preferred = PREFERRED_MODELS.get(family)
         if preferred and preferred in ids:
@@ -642,6 +679,8 @@ class ModelCatalog:
             return self.small
         if self.primary and "haiku" not in low:
             return self.primary
+        if self.only:
+            return self.family_id(requested) or self.only["sonnet"]
 
         available = set(self.chat_model_ids())
         if not available:
@@ -1828,7 +1867,12 @@ class Handler(BaseHTTPRequestHandler):
         if payload is None:
             return
         if payload.get("model"):
-            payload["model"] = self.server.catalog.resolve_model(str(payload["model"]))
+            cat = self.server.catalog
+            if cat.only and not cat.family_id(str(payload["model"])):
+                self._fail(400, f"model {payload['model']}: only {', '.join(cat.only.values())} are enabled "
+                                "(start the proxy with --any-model for the full Copilot catalog)")
+                return
+            payload["model"] = cat.resolve_model(str(payload["model"]))
         stream = bool(payload.get("stream"))
         agent, vision = openai_flags(payload)
         if not self._guard(f"POST {upstream} model={payload.get('model')} stream={stream}", False):
@@ -1931,6 +1975,10 @@ def claude_code_env(base: str, catalog: ModelCatalog, primary: Optional[str], sm
         # (legacy plans: Sonnet 4.6 = 9, Haiku 4.5 = 0.33 premium requests). Override with --subagent-model.
         "CLAUDE_CODE_SUBAGENT_MODEL": subagent or haiku,
         "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+        # Auto mode: Copilot rejects the server-side review (400 "safeguards: Extra inputs are not permitted",
+        # measured), so Claude Code would fall back to its own classifier after a failed request and a notice.
+        # 0 = use its own classifier from the start. Each checked action is then one more model request.
+        "CLAUDE_CODE_AUTO_MODE_SERVER": "0",
     }
     window = catalog.max_prompt_tokens(sonnet)
     if window:
@@ -2103,7 +2151,7 @@ def cmd_start(args: argparse.Namespace) -> None:
         auth = secrets.token_urlsafe(24)
     tm = TokenManager(resolve_github_token(args), account_type=args.account_type, show_token=args.show_token)
     tm.start_background_refresh()
-    catalog = ModelCatalog(tm, primary=args.model, small=args.small_model)
+    catalog = ModelCatalog(tm, primary=args.model, small=args.small_model, any_model=args.any_model)
     catalog.get_models_payload(force=True)
     ids = catalog.chat_model_ids()
     guard = RequestGuard(args.rate_limit, args.wait, args.manual)
@@ -2138,7 +2186,14 @@ def cmd_start(args: argparse.Namespace) -> None:
           + (f"; usage log: {args.usage_log}" if args.usage_log else ""))
     print("Client key: " + ("required" if auth else "none (socket is mode 0600: only your user can connect)" if sock
                             else "none (any local process can use this proxy; see --auth-token)"))
-    print(f"Chat models ({len(ids)}): {', '.join(ids)}")
+    if catalog.only:
+        print(f"Models: only {', '.join(catalog.only.values())} (every request maps to one of these by family; "
+              "--any-model for the full catalog)")
+        if catalog.missing():
+            LOG.warning("This Copilot account does not list %s yet: requests for it will fail upstream",
+                        ", ".join(catalog.missing()))
+    else:
+        print(f"Chat models ({len(ids)}): {', '.join(ids)}")
     if args.claude_code:
         env = claude_code_env(base, catalog, args.model, args.small_model, args.subagent_model, sock, auth)
         if args.sandbox:
@@ -2200,6 +2255,9 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("-w", "--wait", action="store_true", help="Wait instead of returning 429 when rate limited")
     s.add_argument("--manual", action="store_true", help="Ask y/N before forwarding each request")
     s.add_argument("-c", "--claude-code", action="store_true", help="Print the Claude Code environment")
+    s.add_argument("--any-model", action="store_true", default=os.environ.get("COPILOT_PROXY_ANY_MODEL") == "1",
+                   help="serve the full Copilot catalog; default: only the three Claude 5.5 models "
+                        "(claude-sonnet-5.5, claude-opus-5.5, claude-haiku-5.5), every request mapped by family")
     s.add_argument("--cors-origin", action="append",
                    help="allow browser requests from this Origin (repeatable; '*' = any). Default: none")
     s.add_argument("--allow-host", action="append",

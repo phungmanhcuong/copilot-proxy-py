@@ -31,21 +31,41 @@ after that.
 ```bash
 ANTHROPIC_BASE_URL=http://127.0.0.1:4141 \
 ANTHROPIC_AUTH_TOKEN=dummy \
-ANTHROPIC_MODEL=claude-sonnet-4.6 \
-ANTHROPIC_DEFAULT_HAIKU_MODEL=claude-haiku-4.5 \
-CLAUDE_CODE_SUBAGENT_MODEL=claude-haiku-4.5 \
-CLAUDE_CODE_AUTO_COMPACT_WINDOW=200000 \
+ANTHROPIC_MODEL=claude-sonnet-5.5 \
+ANTHROPIC_DEFAULT_SONNET_MODEL=claude-sonnet-5.5 \
+ANTHROPIC_DEFAULT_OPUS_MODEL=claude-opus-5.5 \
+ANTHROPIC_DEFAULT_HAIKU_MODEL=claude-haiku-5.5 \
+CLAUDE_CODE_SUBAGENT_MODEL=claude-haiku-5.5 \
 CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 \
+CLAUDE_CODE_AUTO_MODE_SERVER=0 \
 claude
 ```
 
-**Default models.** The defaults are the Claude 5.5 family: `claude-sonnet-5.5` (main), `claude-opus-5.5` and
-`claude-haiku-5.5` (subagents and background calls).
-- A family whose 5.5 model your account's `/models` doesn't list falls back to the newest version it does list.
-  For example, legacy annual plans get no new models, so they stay on `claude-sonnet-4.6`, `claude-opus-4.8` and
-  `claude-haiku-4.5`.
-- Change the defaults with `COPILOT_PROXY_DEFAULT_SONNET`, `COPILOT_PROXY_DEFAULT_OPUS` and
-  `COPILOT_PROXY_DEFAULT_HAIKU`, or with `-m` / `-s`.
+**Models: only the three Claude 5.5 models.** By default the proxy offers and uses only `claude-sonnet-5.5` (main),
+`claude-opus-5.5` and `claude-haiku-5.5` (subagents and background calls).
+- `/v1/models` lists only these three, so Claude Code's model picker shows only them.
+- Every Claude request is mapped to the 5.5 model of its family (`claude-sonnet-4-6` → `claude-sonnet-5.5`,
+  `claude-haiku-4-5-20251001` → `claude-haiku-5.5`, `opus` → `claude-opus-5.5`); any other name → `claude-sonnet-5.5`.
+- On the OpenAI routes (`/v1/chat/completions`, `/v1/responses`) a non-Claude model gets a 400.
+- At start the proxy warns if your Copilot account doesn't list one of the three. Requests for it then fail upstream
+  (`model_not_supported`); the proxy doesn't fall back to an older model.
+- `--any-model` (env `COPILOT_PROXY_ANY_MODEL=1`) restores the full Copilot catalog. There the 5.5 models are the
+  defaults and a family without a 5.5 model falls back to the newest version listed (e.g. legacy annual plans:
+  `claude-sonnet-4.6`, `claude-opus-4.8`, `claude-haiku-4.5`).
+- Change the three ids with `COPILOT_PROXY_DEFAULT_SONNET`, `COPILOT_PROXY_DEFAULT_OPUS` and
+  `COPILOT_PROXY_DEFAULT_HAIKU`; `-m` / `-s` pick among them.
+
+**Auto mode** (`--permission-mode auto`, or Shift+Tab). Measured with Claude Code 2.1.330:
+- Claude Code turns auto mode on only for models it supports. All three 5.5 models pass. `claude-haiku-4.5` doesn't,
+  so with it Claude Code silently stays in ask mode and asks for every action.
+- With a direct Anthropic connection, the safety check of each action runs on Anthropic's server. Copilot rejects
+  that request field (400 `safeguards: Extra inputs are not permitted`), so through this proxy Claude Code checks
+  each action with its own classifier request. Each checked action is one more model request, billed by Copilot
+  like a prompt.
+- `CLAUDE_CODE_AUTO_MODE_SERVER=0` (printed by `-c`) makes Claude Code use its own classifier from the start. Without
+  it the first request fails once and Claude Code prints a notice that the session "isn't eligible".
+- Claude Code says a later release will remove this fallback for sessions behind a gateway. After that, checked
+  actions are asked about or denied.
 
 Use the model ids that `start -c` prints for your account. You can also put the same variables under `"env"` in
 `.claude/settings.json` (measured with TCP). In Unix-socket mode, the connection variables must be in the shell; see
@@ -74,7 +94,8 @@ python3 copilot_proxy.py auth             # GitHub device login only
 |---|---|
 | `-r 5 -w` | at most one request per 5 s; with `-w` it waits instead of returning 429 |
 | `--manual` | ask y/N in the terminal before each request is forwarded |
-| `-m`, `-s` | force the model ids used for normal and haiku-class requests |
+| `-m`, `-s` | force the model ids used for normal and haiku-class requests (one of the three 5.5 models) |
+| `--any-model` | serve the full Copilot catalog instead of only the three Claude 5.5 models |
 | `-a` | account type for Copilot Business or Enterprise |
 | `--unix-socket PATH` | listen on a Unix socket (mode 0600) instead of TCP; see [Sandbox mode](#sandbox-mode) |
 | `--auth-token KEY\|auto` | require a client key on every route except `/health`; `auto` generates one and prints it in the `-c` env. Prefer env `COPILOT_PROXY_AUTH_TOKEN` over the flag (command lines are visible in `ps`) |
