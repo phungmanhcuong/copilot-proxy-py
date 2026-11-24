@@ -104,6 +104,23 @@ Claude Code settings that also cut tokens (all exist in Claude Code 2.1.330):
 
 Don't set `DISABLE_PROMPT_CACHING`.
 
+## Copilot API version
+
+The proxy presents itself as the current stable Copilot client: **VS Code 1.147.0 with Copilot Chat 0.75.0**.
+Copilot Chat now ships inside VS Code; the standalone extension repo was archived in May 2026. The values come from
+`microsoft/vscode` at tag `1.147.0`, `extensions/copilot`.
+
+| Header | Value | Override |
+|---|---|---|
+| `Editor-Version` | `vscode/1.147.0` | `COPILOT_PROXY_VSCODE_VERSION` |
+| `Editor-Plugin-Version`, `User-Agent` | `copilot-chat/0.75.0`, `GitHubCopilotChat/0.75.0` | `COPILOT_PROXY_CHAT_VERSION` |
+| `X-GitHub-Api-Version` on Copilot API calls | `2026-01-09` | `COPILOT_PROXY_COPILOT_API_VERSION` |
+| `X-GitHub-Api-Version` for the token exchange and quota on api.github.com | `2025-04-01` | `COPILOT_PROXY_GITHUB_API_VERSION` |
+| `OpenAI-Intent`, `X-Interaction-Type` | `conversation-panel` | – |
+
+Copilot rejects an unknown API version (`400 invalid apiVersion`). If a future Copilot release does that to these
+values, set the overrides to the new client's values.
+
 ## Security
 - The proxy binds to `127.0.0.1` by default.
 - Requests whose `Host` isn't `127.0.0.1`, `localhost` or `[::1]` get 403. This blocks DNS rebinding. Add names

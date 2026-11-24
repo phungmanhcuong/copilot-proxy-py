@@ -51,10 +51,19 @@ COPILOT_API_URLS = {
     "enterprise": "https://api.enterprise.githubcopilot.com",
 }
 
-EDITOR_VERSION = "vscode/1.99.0"
-EDITOR_PLUGIN_VERSION = "copilot-chat/0.26.7"
-COPILOT_USER_AGENT = "GitHubCopilotChat/0.26.7"
-GITHUB_API_VERSION = "2025-04-01"
+# Client identity and API versions of the current stable GitHub Copilot client: VS Code 1.147.0 with its bundled
+# Copilot Chat 0.75.0 (microsoft/vscode tag 1.147.0, extensions/copilot; the standalone vscode-copilot-chat repo
+# was archived in May 2026). Copilot API calls use 2026-01-09 (platform/networking/common/networking.ts); the
+# token exchange and quota calls on api.github.com still use 2025-04-01 (copilotTokenManager.ts,
+# chatQuotaServiceImpl.ts). Override with env when a newer client ships.
+VSCODE_VERSION = os.environ.get("COPILOT_PROXY_VSCODE_VERSION", "1.147.0")
+COPILOT_CHAT_VERSION = os.environ.get("COPILOT_PROXY_CHAT_VERSION", "0.75.0")
+EDITOR_VERSION = f"vscode/{VSCODE_VERSION}"
+EDITOR_PLUGIN_VERSION = f"copilot-chat/{COPILOT_CHAT_VERSION}"
+COPILOT_USER_AGENT = f"GitHubCopilotChat/{COPILOT_CHAT_VERSION}"
+GITHUB_API_VERSION = os.environ.get("COPILOT_PROXY_GITHUB_API_VERSION", "2025-04-01")    # api.github.com
+COPILOT_API_VERSION = os.environ.get("COPILOT_PROXY_COPILOT_API_VERSION", "2026-01-09")  # api.*.githubcopilot.com
+COPILOT_INTENT = "conversation-panel"
 
 # Default Claude models (Claude 5.5 family), used when the account's /models lists them; otherwise the newest
 # listed version of the family. Override with COPILOT_PROXY_DEFAULT_{SONNET,OPUS,HAIKU} or -m / -s.
@@ -406,8 +415,9 @@ class TokenManager:
             "Editor-Version": EDITOR_VERSION,
             "Editor-Plugin-Version": EDITOR_PLUGIN_VERSION,
             "User-Agent": COPILOT_USER_AGENT,
-            "Openai-Intent": "conversation-panel",
-            "X-GitHub-Api-Version": GITHUB_API_VERSION,
+            "OpenAI-Intent": COPILOT_INTENT,
+            "X-Interaction-Type": COPILOT_INTENT,
+            "X-GitHub-Api-Version": COPILOT_API_VERSION,
             "X-Initiator": "agent" if is_agent else "user",
             "X-Request-Id": str(uuid.uuid4()),
         }
