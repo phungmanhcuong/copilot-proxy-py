@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.log
+.env
+github_token
+*.token
+.DS_Store
