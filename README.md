@@ -33,7 +33,8 @@ ANTHROPIC_BASE_URL=http://127.0.0.1:4141 \
 ANTHROPIC_AUTH_TOKEN=dummy \
 ANTHROPIC_MODEL=claude-sonnet-4.6 \
 ANTHROPIC_DEFAULT_HAIKU_MODEL=claude-haiku-4.5 \
-DISABLE_NON_ESSENTIAL_MODEL_CALLS=1 \
+CLAUDE_CODE_SUBAGENT_MODEL=claude-haiku-4.5 \
+CLAUDE_CODE_AUTO_COMPACT_WINDOW=200000 \
 CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 \
 claude
 ```
@@ -67,23 +68,60 @@ python3 copilot_proxy.py auth             # GitHub device login only
 | `-m`, `-s` | force the model ids used for normal and haiku-class requests |
 | `-a` | account type for Copilot Business or Enterprise |
 
+## Token and premium-request saving
+
+Copilot bills in one of two ways:
+- **Legacy annual plans** pay **premium requests**: one per prompt *you* send, multiplied by the model's rate
+  (Haiku 4.5 = 0.33, Sonnet 4.6 = 9, Opus 4.8 = 27). Tool-call follow-ups are free.
+- **Usage-based plans** (since June 2026) pay **per token**, and a cached input token costs a tenth of an uncached one.
+
+The proxy cuts both:
+
+| What | Switch | Measured (Claude Code 2.1.330, same 2–3 tool-turn task) |
+|---|---|---|
+| **Native `/v1/messages` pass-through** for models that list it (Claude). It forwards the request as is, so Claude Code's `cache_control` breakpoints, thinking blocks and signatures survive. Everything else is translated to `/chat/completions`. If Copilot rejects a native request, the proxy falls back to translation. | `--mode auto` (default), `native`, `translate`; env `COPILOT_PROXY_MODE` | Warm runs: **18–26** uncached input tokens native against **18,022–18,238** translated; cache hit 99.0–99.1% against 73.6–80.1%; at Copilot's Haiku token prices the warm run costs about 64% less. The first run of a session pays a one-time cache write. All answers correct (8 runs). |
+| **Exact `count_tokens`** from Copilot's native endpoint, so Claude Code compacts at the right time | `--count-tokens auto` (default), `native`, `estimate` | native count = real input tokens on 5 of 5 requests; the old local estimate was off by 25.5% on average (−52% with tool definitions) |
+| **Agent follow-ups marked as agent:** turns that only carry tool results are sent with `X-Initiator: agent` and are not billed as new prompts | always on | 4 Haiku task runs (12 model calls) cost 1 premium request (4 × 0.33) |
+| **Subagents on the cheap model:** `start -c` prints `CLAUDE_CODE_SUBAGENT_MODEL` = the Haiku model, because every subagent starts with a fresh, billed prompt | `--subagent-model` | 0.33 instead of 9 premium requests per subagent on legacy plans |
+| **Compaction window = Copilot's prompt limit:** `start -c` prints `CLAUDE_CODE_AUTO_COMPACT_WINDOW` from `/models` (200,000 for Sonnet 4.6), so a long session compacts before Copilot rejects it | printed env | – |
+| **Output clamp:** `max_tokens` is capped at the model's output limit, and `thinking.budget_tokens` is kept below it, so a request is never rejected and re-sent | always on | – |
+| **`Retry-After` passed through:** on a Copilot 429/5xx the proxy forwards `retry-after` and the request id, so Claude Code's own retry waits the right time. Optional retries inside the proxy, before streaming, are for other clients; a rejected 429/5xx costs no tokens either way. | env `COPILOT_PROXY_RETRIES` (default 0) | – |
+| **Usage log:** one JSON line per request with input, cache read, cache write and output tokens, route, model and initiator; totals and cache-hit ratio at `GET /stats` | `--usage-log FILE`, env `COPILOT_PROXY_USAGE_LOG` | – |
+
+Claude Code settings that also cut tokens (all exist in Claude Code 2.1.330):
+- `MAX_MCP_OUTPUT_TOKENS` caps large MCP tool outputs.
+- `ENABLE_TOOL_SEARCH` loads MCP tool definitions only when they are needed.
+- `CLAUDE_CODE_EFFORT_LEVEL` and `MAX_THINKING_TOKENS` limit thinking.
+- `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE` makes compaction start earlier.
+
+Don't set `DISABLE_PROMPT_CACHING`.
+
+## Security
+- The proxy binds to `127.0.0.1` by default.
+- Requests whose `Host` isn't `127.0.0.1`, `localhost` or `[::1]` get 403. This blocks DNS rebinding. Add names
+  with `--allow-host`.
+- Browser requests that carry an `Origin` get 403, and no CORS headers are sent. This stops any web page from using
+  your account. Allow an origin with `--cors-origin`.
+- If you bind to `0.0.0.0`, anyone who can reach the port uses your Copilot account.
+
 ## Endpoints
 - `POST /v1/messages`: Anthropic Messages, with or without streaming
 - `POST /v1/messages/count_tokens`: an estimate, since the standard library has no tokenizer
 - `POST /v1/chat/completions`: passed through to Copilot
+- `POST /v1/responses`: passed through to Copilot, for `/responses`-only models such as `gpt-5.3-codex`
+- `GET /stats`: token totals and cache-hit ratio since start
 - `POST /v1/embeddings`: passed through to Copilot
 - `GET /v1/models`
 - `GET /usage`
 - `GET /health`
 - `GET /token`: disabled unless you pass `--show-token`
 
-The proxy binds to `127.0.0.1` by default. Don't expose it on a network: anyone who can reach it can use your
-Copilot account.
-
 ## Notes
-- Anthropic `thinking` blocks in the history are dropped, because the OpenAI format has no field for them.
-- Anthropic server tools (for example `web_search`) are not forwarded.
-- Follow-up turns in a tool loop are sent with `X-Initiator: agent`, as copilot-api does.
+- On the translated route (non-Claude models), Anthropic `thinking` blocks in the history are dropped, because the
+  OpenAI format has no field for them. Anthropic server tools (for example `web_search`) are not forwarded. The
+  native route keeps both.
+- Follow-up turns in a tool loop are sent with `X-Initiator: agent`, as copilot-api does. Fresh prompts, including
+  a subagent's first prompt, are sent as `user`: the proxy never relabels a new prompt to avoid billing.
 
 ## License
 MIT. See `LICENSE`.
