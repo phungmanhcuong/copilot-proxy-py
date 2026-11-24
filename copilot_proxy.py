@@ -56,6 +56,14 @@ EDITOR_PLUGIN_VERSION = "copilot-chat/0.26.7"
 COPILOT_USER_AGENT = "GitHubCopilotChat/0.26.7"
 GITHUB_API_VERSION = "2025-04-01"
 
+# Default Claude models (Claude 5.5 family), used when the account's /models lists them; otherwise the newest
+# listed version of the family. Override with COPILOT_PROXY_DEFAULT_{SONNET,OPUS,HAIKU} or -m / -s.
+PREFERRED_MODELS = {
+    "sonnet": os.environ.get("COPILOT_PROXY_DEFAULT_SONNET", "claude-sonnet-5.5"),
+    "opus": os.environ.get("COPILOT_PROXY_DEFAULT_OPUS", "claude-opus-5.5"),
+    "haiku": os.environ.get("COPILOT_PROXY_DEFAULT_HAIKU", "claude-haiku-5.5"),
+}
+
 DEFAULT_PORT = 4141
 DEFAULT_HOST = "127.0.0.1"
 # Upstream 429/5xx retries before streaming. Default 0: Claude Code's SDK already retries on Retry-After (which
@@ -500,7 +508,12 @@ class ModelCatalog:
         return sorted(ids)
 
     def newest(self, family: str) -> Optional[str]:
+        """Default model for a family: the preferred Claude 5.5 id when this account's catalog serves it,
+        otherwise the newest version Copilot lists (e.g. legacy annual plans, which get no new models)."""
         ids = [m for m in self.chat_model_ids() if m.startswith("claude") and family in m]
+        preferred = PREFERRED_MODELS.get(family)
+        if preferred and preferred in ids:
+            return preferred
         return max(ids, key=_version_key) if ids else None
 
     def max_output_tokens(self, model_id: str) -> Optional[int]:
@@ -561,7 +574,7 @@ class ModelCatalog:
         if fallback:
             LOG.warning("Unknown model %s; using %s", requested, fallback)
             return fallback
-        return dotted or "claude-sonnet-4"
+        return dotted or PREFERRED_MODELS["sonnet"]
 
 
 # ---------------------------------------------------------------------------
@@ -1557,7 +1570,7 @@ def resolve_github_token(args: argparse.Namespace) -> str:
 def claude_code_env(base: str, catalog: ModelCatalog, primary: Optional[str], small: Optional[str],
                     subagent: Optional[str] = None) -> dict[str, str]:
     """Claude Code settings for this proxy. Variable names checked against the Claude Code 2.1.330 binary."""
-    sonnet = catalog.resolve_model(primary) if primary else (catalog.newest("sonnet") or "claude-sonnet-4")
+    sonnet = catalog.resolve_model(primary) if primary else (catalog.newest("sonnet") or PREFERRED_MODELS["sonnet"])
     haiku = catalog.resolve_model(small) if small else (catalog.newest("haiku") or sonnet)
     opus = catalog.newest("opus") or sonnet
     subagent = catalog.resolve_model(subagent) if subagent else None

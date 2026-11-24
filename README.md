@@ -39,6 +39,14 @@ CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 \
 claude
 ```
 
+**Default models.** The defaults are the Claude 5.5 family: `claude-sonnet-5.5` (main), `claude-opus-5.5` and
+`claude-haiku-5.5` (subagents and background calls).
+- A family whose 5.5 model your account's `/models` doesn't list falls back to the newest version it does list.
+  For example, legacy annual plans get no new models, so they stay on `claude-sonnet-4.6`, `claude-opus-4.8` and
+  `claude-haiku-4.5`.
+- Change the defaults with `COPILOT_PROXY_DEFAULT_SONNET`, `COPILOT_PROXY_DEFAULT_OPUS` and
+  `COPILOT_PROXY_DEFAULT_HAIKU`, or with `-m` / `-s`.
+
 Use the model ids that `start -c` prints for your account. You can also put the same variables under `"env"` in
 `.claude/settings.json`.
 
