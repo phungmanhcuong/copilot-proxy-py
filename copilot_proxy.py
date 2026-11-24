@@ -12,7 +12,11 @@ Python port of the design of github.com/ericc-ch/copilot-api, with these additio
   * default models come from the live /models catalog, printed as the current
     Claude Code variables (ANTHROPIC_DEFAULT_*_MODEL);
   * an unknown model re-fetches the catalog and falls back to a real chat model;
-  * an existing Copilot editor login (~/.config/github-copilot/apps.json) is reused.
+  * an existing Copilot editor login (~/.config/github-copilot/apps.json) is reused;
+  * Claude models go through Copilot's native /v1/messages (prompt cache kept), with exact count_tokens and
+    stepped server-side context editing;
+  * Unix-socket listener (ANTHROPIC_UNIX_SOCKET), optional client key, Claude Code sandbox settings, a macOS
+    sandbox-exec mode for the proxy itself, and HTTPS_PROXY support.
 
 Requires Python 3.9+. No third-party packages.
 """
@@ -20,12 +24,21 @@ Requires Python 3.9+. No third-party packages.
 from __future__ import annotations
 
 import argparse
+import base64
+import hmac
 import http.client
 import json
 import logging
 import os
 import re
+import secrets
+import shlex
+import signal
+import socket
+import socketserver
 import ssl
+import stat
+import tempfile
 import sys
 import threading
 import time
@@ -53,8 +66,9 @@ COPILOT_API_URLS = {
 
 # Client identity and API versions of the current stable GitHub Copilot client: VS Code 1.147.0 with its bundled
 # Copilot Chat 0.75.0 (microsoft/vscode tag 1.147.0, extensions/copilot; the standalone vscode-copilot-chat repo
-# was archived in May 2026). Copilot API calls use 2026-01-09 (platform/networking/common/networking.ts); the
-# token exchange and quota calls on api.github.com still use 2025-04-01 (copilotTokenManager.ts,
+# was archived in May 2026). Copilot API calls use 2026-08-01: networking.ts has 2026-01-09, but the
+# @vscode/copilot-api 0.5.2 package the extension depends on overwrites it in _mixinHeaders for every Copilot API
+# request. The token exchange and quota calls on api.github.com still use 2025-04-01 (copilotTokenManager.ts,
 # chatQuotaServiceImpl.ts). Override with env when a newer client ships.
 VSCODE_VERSION = os.environ.get("COPILOT_PROXY_VSCODE_VERSION", "1.147.0")
 COPILOT_CHAT_VERSION = os.environ.get("COPILOT_PROXY_CHAT_VERSION", "0.75.0")
@@ -62,7 +76,7 @@ EDITOR_VERSION = f"vscode/{VSCODE_VERSION}"
 EDITOR_PLUGIN_VERSION = f"copilot-chat/{COPILOT_CHAT_VERSION}"
 COPILOT_USER_AGENT = f"GitHubCopilotChat/{COPILOT_CHAT_VERSION}"
 GITHUB_API_VERSION = os.environ.get("COPILOT_PROXY_GITHUB_API_VERSION", "2025-04-01")    # api.github.com
-COPILOT_API_VERSION = os.environ.get("COPILOT_PROXY_COPILOT_API_VERSION", "2026-01-09")  # api.*.githubcopilot.com
+COPILOT_API_VERSION = os.environ.get("COPILOT_PROXY_COPILOT_API_VERSION", "2026-08-01")  # api.*.githubcopilot.com
 COPILOT_INTENT = "conversation-panel"
 
 # Default Claude models (Claude 5.5 family), used when the account's /models lists them; otherwise the newest
@@ -85,6 +99,26 @@ RETRY_STATUSES = (429, 500, 502, 503, 504, 529)
 MAX_RETRY_WAIT = 20.0  # longer Retry-After values go back to the client instead of blocking here
 CONNECT_TIMEOUT = 15
 REQUEST_TIMEOUT = 600
+MAX_BODY = 64 * 1024 * 1024  # largest accepted request body (Claude Code sends images base64-encoded)
+
+# Server-side context editing on the native Claude route, with the values the official Copilot client sends
+# (microsoft/vscode extensions/copilot platform/networking/common/anthropic.ts buildContextManagement): once a
+# request is over CLEAR_TRIGGER input tokens, Copilot replaces all but the last CLEAR_KEEP tool results with a
+# placeholder. Only added when the client sent no `context_management` of its own.
+CONTEXT_EDIT_MODES = ("off", "tools", "thinking", "both")
+CONTEXT_MANAGEMENT_BETA = "context-management-2025-06-27"
+
+
+def _env_int(name: str, default: int, lo: int, hi: int) -> int:
+    try:
+        return max(lo, min(hi, int(os.environ.get(name, default))))
+    except ValueError:
+        return default
+
+
+CLEAR_TRIGGER = _env_int("COPILOT_PROXY_CLEAR_TRIGGER", 100000, 1000, 10_000_000)
+CLEAR_KEEP = _env_int("COPILOT_PROXY_CLEAR_KEEP", 3, 0, 1000)
+CLEAR_STEP = _env_int("COPILOT_PROXY_CLEAR_STEP", 10, 1, 1000)
 
 LOG = logging.getLogger("copilot-proxy")
 
@@ -173,7 +207,14 @@ def _route_unsupported(status: int, raw: bytes) -> bool:
         return True
     if status in (400, 422):
         text = raw[:2000].decode("utf-8", errors="replace").lower()
-        return any(s in text for s in ("not supported", "unsupported", "unknown endpoint", "model_not_supported"))
+        if "model_not_supported" in text or "unknown endpoint" in text:
+            return True
+        # only a refusal of the model or endpoint; a rejected field, beta or strategy is the request's own error
+        # and must not silently move the whole prompt to the translated route (losing the prompt cache)
+        about_route = ("model" in text or "endpoint" in text) and not any(
+            s in text for s in ("context_management", "context management", "context-management", "beta", "strategy",
+                                "field", "inputs", "thinking", "tool", "parameter", "image", "cache"))
+        return about_route and ("not supported" in text or "unsupported" in text)
     return False
 
 
@@ -194,18 +235,50 @@ def host_name(value: str) -> Optional[str]:
 def open_upstream(
     base_url: str, path: str, method: str, headers: dict[str, str], body: Optional[bytes]
 ) -> tuple[http.client.HTTPConnection, http.client.HTTPResponse]:
-    """Raw connection so a streamed (SSE) body can be read line by line."""
+    """Raw connection so a streamed (SSE) body can be read line by line. Honours HTTPS_PROXY / HTTP_PROXY /
+    NO_PROXY like urllib does (HTTPS through an HTTP CONNECT tunnel)."""
     parsed = urllib.parse.urlsplit(base_url)
     host = parsed.hostname or ""
     full_path = parsed.path.rstrip("/") + path
+    proxy = upstream_proxy(parsed.scheme, host)
     if parsed.scheme == "https":
-        conn: http.client.HTTPConnection = http.client.HTTPSConnection(
-            host, parsed.port or 443, timeout=REQUEST_TIMEOUT, context=_SSL
-        )
+        if proxy:
+            conn: http.client.HTTPConnection = http.client.HTTPSConnection(
+                proxy[0], proxy[1], timeout=REQUEST_TIMEOUT, context=_SSL)
+            conn.set_tunnel(host, parsed.port or 443, headers=proxy[2])
+        else:
+            conn = http.client.HTTPSConnection(host, parsed.port or 443, timeout=REQUEST_TIMEOUT, context=_SSL)
+    elif proxy:
+        conn = http.client.HTTPConnection(proxy[0], proxy[1], timeout=REQUEST_TIMEOUT)
+        full_path = urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, full_path, "", ""))
+        headers = {**headers, **proxy[2]}
     else:
         conn = http.client.HTTPConnection(host, parsed.port or 80, timeout=REQUEST_TIMEOUT)
     conn.request(method, full_path, body=body, headers=headers)
     return conn, conn.getresponse()
+
+
+def upstream_proxy(scheme: str, host: str) -> Optional[tuple[str, int, dict[str, str]]]:
+    """(proxy host, port, Proxy-Authorization header) from the environment, or None."""
+    if not host or urllib.request.proxy_bypass(host):
+        return None
+    proxies = urllib.request.getproxies()
+    url = proxies.get(scheme) or proxies.get("all")
+    if not url:
+        return None
+    p = urllib.parse.urlsplit(url if "://" in url else "http://" + url)
+    if p.scheme not in ("http", "") or not p.hostname:
+        # fail closed: going direct could bypass a required egress proxy
+        raise OSError(f"Unsupported {p.scheme}:// proxy for {scheme} (only http:// proxies)")
+    try:
+        port = p.port or 8080
+    except ValueError:
+        raise OSError(f"Invalid port in {scheme} proxy setting")
+    auth = {}
+    if p.username is not None:
+        cred = f"{urllib.parse.unquote(p.username)}:{urllib.parse.unquote(p.password or '')}"
+        auth["Proxy-Authorization"] = "Basic " + base64.b64encode(cred.encode()).decode()
+    return p.hostname, port, auth
 
 
 # ---------------------------------------------------------------------------
@@ -234,13 +307,32 @@ def load_github_token(path: Path) -> Optional[str]:
     return None
 
 
+def private_dir(path: Path) -> None:
+    """Create a directory as 0700; warn when an existing one is writable by others."""
+    if not path.exists():
+        try:
+            path.mkdir(parents=True, mode=0o700)
+            os.chmod(path, 0o700)
+        except FileExistsError:
+            pass
+        if not path.is_dir():
+            raise SystemExit(f"{path} is not a directory")
+    elif os.name != "nt" and path.stat().st_mode & 0o022:
+        LOG.warning("%s is writable by other users; its files could be replaced", path)
+
+
 def save_github_token(path: Path, token: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(token.strip() + "\n", encoding="utf-8")
+    """Atomic write, created as 0600 (never briefly readable by others)."""
+    private_dir(path.parent)
+    fd, name = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp")  # 0600
+    tmp = Path(name)
     try:
-        os.chmod(path, 0o600)
-    except OSError:
-        pass
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(token.strip() + "\n")
+        os.replace(tmp, path)
+    finally:
+        if tmp.exists():
+            tmp.unlink()
 
 
 def copilot_token_works(github_token: str) -> tuple[bool, int]:
@@ -1012,6 +1104,73 @@ def anthropic_flags(payload: dict[str, Any]) -> tuple[bool, bool]:
     return agent, vision
 
 
+def context_management_for(body: dict[str, Any], mode: str) -> Optional[dict[str, Any]]:
+    """The `context_management` block to send on a native request, or None to leave the body as it is.
+    Edits the client already asked for are kept unchanged; the proxy only adds an edit type the client did not
+    send (clear_thinking first, as the API requires)."""
+    own = body.get("context_management")
+    if mode == "off" or (own is not None and not (isinstance(own, dict) and isinstance(own.get("edits"), list))):
+        return None
+    edits: list[Any] = list(own["edits"]) if own else []
+    types = {e.get("type") for e in edits if isinstance(e, dict) and isinstance(e.get("type"), str)}
+    msgs = body.get("messages") if isinstance(body.get("messages"), list) else []
+    added = False
+    th = body.get("thinking")
+    if mode in ("thinking", "both") and isinstance(th, dict) and th.get("type") in ("enabled", "adaptive") \
+            and "clear_thinking_20251015" not in types:
+        edits.insert(0, {"type": "clear_thinking_20251015", "keep": {"type": "thinking_turns", "value": 1}})
+        added = True
+    n_tool_uses = sum(1 for m in msgs if isinstance(m, dict) and isinstance(m.get("content"), list)
+                      for b in m["content"] if isinstance(b, dict) and b.get("type") == "tool_use")
+    # Copilot evaluates the trigger on the full history every request, so a fixed `keep` clears one more tool
+    # result on every tool turn and the whole cached prefix is rewritten each time (measured). Clearing in steps
+    # of CLEAR_STEP tool uses keeps the cleared set, and so the cached prefix, unchanged between steps.
+    n_clear = (max(0, n_tool_uses - CLEAR_KEEP) // CLEAR_STEP) * CLEAR_STEP
+    if n_clear == 0 and n_tool_uses > CLEAR_KEEP:
+        # fewer tool uses than one step: a few huge results can still pass the trigger, so clear per turn
+        n_clear = n_tool_uses - CLEAR_KEEP
+    if mode in ("tools", "both") and n_clear and "clear_tool_uses_20250919" not in types:
+        edits.append({"type": "clear_tool_uses_20250919",
+                      "trigger": {"type": "input_tokens", "value": CLEAR_TRIGGER},
+                      "keep": {"type": "tool_uses", "value": n_tool_uses - n_clear}})
+        added = True
+    return {**(own or {}), "edits": edits} if added else None
+
+
+def cleared_input_tokens(ev: Any) -> Optional[int]:
+    """Sum of `cleared_input_tokens` in a response or stream event's context_management.applied_edits."""
+    if not isinstance(ev, dict):
+        return None
+    for holder in (ev, ev.get("delta"), ev.get("message")):
+        cm = _dict_get(holder, "context_management")
+        edits = cm.get("applied_edits")
+        if isinstance(edits, list):
+            return sum(e.get("cleared_input_tokens") or 0 for e in edits
+                       if isinstance(e, dict) and isinstance(e.get("cleared_input_tokens"), int))
+    return None
+
+
+class _Replay:
+    """An upstream response whose body was already read (status, headers and body kept)."""
+
+    def __init__(self, resp: http.client.HTTPResponse, raw: bytes):
+        self.status, self._resp, self._raw = resp.status, resp, raw
+
+    def read(self) -> bytes:
+        raw, self._raw = self._raw, b""
+        return raw
+
+    def getheader(self, name: str, default: Optional[str] = None) -> Optional[str]:
+        return self._resp.getheader(name, default)
+
+
+def _context_edit_refused(status: int, raw: bytes) -> bool:
+    low = raw[:2000].lower()
+    return status == 400 and (b"context_management" in low or b"context management" in low
+                              or b"context-management" in low
+                              or b"clear_tool_uses" in low or b"clear_thinking" in low)
+
+
 class UsageLog:
     """Per-request token accounting: optional JSONL file plus running totals for GET /stats."""
 
@@ -1022,7 +1181,7 @@ class UsageLog:
         self._lock = threading.Lock()
         self.started = time.time()
         self.totals: dict[str, Any] = {"requests": 0, "errors": 0, **{f: 0 for f in self.FIELDS},
-                                       "by_route": {}, "by_model": {}}
+                                       "cleared_input_tokens": 0, "by_route": {}, "by_model": {}}
 
     def record(self, **row: Any) -> None:
         raw = row.get("usage") if isinstance(row.get("usage"), dict) else {}
@@ -1040,6 +1199,8 @@ class UsageLog:
                 t["errors"] += 1
             for f in self.FIELDS:
                 t[f] += int(usage.get(f) or 0)
+            if isinstance(row.get("cleared_input_tokens"), int):
+                t["cleared_input_tokens"] += max(0, row["cleared_input_tokens"])
             for key, name in (("by_route", row.get("route")), ("by_model", row.get("model"))):
                 if name:
                     b = t[key].setdefault(name, {"requests": 0, **{f: 0 for f in self.FIELDS}})
@@ -1077,13 +1238,11 @@ def anthropic_error(status: int, message: str) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-class ProxyServer(ThreadingHTTPServer):
-    allow_reuse_address = True
-    daemon_threads = True
+class _ProxyConfig:
+    """Settings shared by the TCP and the Unix-socket server."""
 
-    def __init__(self, addr: tuple[str, int], tm: TokenManager, catalog: ModelCatalog,
-                 guard: RequestGuard, show_token: bool, mode: str = "auto", count_mode: str = "auto",
-                 usage: Optional[UsageLog] = None):
+    def _setup(self, tm: TokenManager, catalog: ModelCatalog, guard: RequestGuard, show_token: bool,
+               mode: str, count_mode: str, usage: Optional[UsageLog]) -> None:
         self.tm = tm
         self.catalog = catalog
         self.guard = guard
@@ -1092,10 +1251,12 @@ class ProxyServer(ThreadingHTTPServer):
         self.count_mode = count_mode  # auto | native | estimate
         self.usage = usage or UsageLog(None)
         self.cors_origins: set[str] = set()
-        self.allowed_hosts = {"127.0.0.1", "localhost", "[::1]"} | {h for h in [host_name(str(addr[0]))] if h}
-        # binding to all interfaces is an explicit choice to accept any Host
-        self.check_host = addr[0] not in ("0.0.0.0", "::", "")
-        super().__init__(addr, Handler)
+        self.allowed_hosts = {"127.0.0.1", "localhost", "[::1]"}
+        self.check_host = True
+        self.auth_token: Optional[str] = None   # required client key (Authorization: Bearer / x-api-key)
+        self.context_edit = "off"               # off | tools | thinking | both
+        self.no_context_edit: set[str] = set()  # models that refused context_management
+        self.is_unix = False
 
     def use_native(self, model: str) -> bool:
         if self.mode == "translate":
@@ -1105,9 +1266,77 @@ class ProxyServer(ThreadingHTTPServer):
         return self.catalog.supports_endpoint(model, "/v1/messages")
 
 
+class ProxyServer(_ProxyConfig, ThreadingHTTPServer):
+    allow_reuse_address = True
+    daemon_threads = True
+
+    def __init__(self, addr: tuple[str, int], tm: TokenManager, catalog: ModelCatalog,
+                 guard: RequestGuard, show_token: bool, mode: str = "auto", count_mode: str = "auto",
+                 usage: Optional[UsageLog] = None):
+        self._setup(tm, catalog, guard, show_token, mode, count_mode, usage)
+        self.allowed_hosts |= {h for h in [host_name(str(addr[0]))] if h}
+        # binding to all interfaces is an explicit choice to accept any Host
+        self.check_host = addr[0] not in ("0.0.0.0", "::", "")
+        super().__init__(addr, Handler)
+
+
+# Windows has no socketserver.UnixStreamServer; --unix-socket is refused there (cmd_start)
+_UnixBase = getattr(socketserver, "UnixStreamServer", socketserver.TCPServer)
+
+
+class UnixProxyServer(_ProxyConfig, socketserver.ThreadingMixIn, _UnixBase):
+    """Listens on a Unix socket only (Claude Code: ANTHROPIC_UNIX_SOCKET). The socket file is mode 0600, so only
+    this user can connect, and there is no TCP port for other local processes or sandboxed commands."""
+    daemon_threads = True
+
+    def __init__(self, path: str, tm: TokenManager, catalog: ModelCatalog, guard: RequestGuard,
+                 show_token: bool, mode: str = "auto", count_mode: str = "auto",
+                 usage: Optional[UsageLog] = None):
+        self._setup(tm, catalog, guard, show_token, mode, count_mode, usage)
+        self.is_unix = True
+        self.check_host = False  # no TCP listener, so no DNS rebinding; Origin is still checked
+        p = Path(path).expanduser().absolute()
+        self.socket_path = p  # before bind: a failed bind calls server_close()
+        self._owns_socket = False
+        private_dir(p.parent)
+        if p.exists() or p.is_symlink():
+            if not stat.S_ISSOCK(p.lstat().st_mode):
+                raise SystemExit(f"{p} exists and is not a socket; refusing to replace it")
+            probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            probe.settimeout(2)
+            try:
+                probe.connect(str(p))
+                raise SystemExit(f"Another proxy is already listening on {p}")
+            except (ConnectionRefusedError, FileNotFoundError):
+                p.unlink(missing_ok=True)  # nobody listens: stale socket from an earlier run
+            except OSError as exc:
+                raise SystemExit(f"Cannot check the existing socket {p}: {exc}")
+            finally:
+                probe.close()
+        old = os.umask(0o177)
+        try:
+            super().__init__(str(p), Handler)
+        finally:
+            os.umask(old)
+        os.chmod(str(p), 0o600)
+        self._owns_socket = True
+
+    def server_close(self) -> None:
+        super().server_close()
+        if getattr(self, "_owns_socket", False):  # never remove a socket this process did not create
+            try:
+                self.socket_path.unlink()
+            except OSError:
+                pass
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
-    server: ProxyServer
+    server: Any  # ProxyServer | UnixProxyServer
+
+    def address_string(self) -> str:
+        ca = self.client_address
+        return ca[0] if isinstance(ca, tuple) and ca else "unix"
 
     def log_message(self, fmt: str, *args: Any) -> None:
         LOG.info("%s %s", self.address_string(), fmt % args)
@@ -1136,11 +1365,25 @@ class Handler(BaseHTTPRequestHandler):
         allowed = self.server.cors_origins
         if reason is None and origin and not ("*" in allowed or origin in allowed):
             reason = f"Origin '{origin}' not allowed (use --cors-origin)"
+        status = 403
+        path = urllib.parse.urlsplit(self.path).path.rstrip("/") or "/"
+        if reason is None and self.server.auth_token and path not in ("/", "/health") \
+                and self.command != "OPTIONS" and not self._key_ok():
+            status, reason = 401, "Missing or wrong proxy key (Authorization: Bearer <key> or x-api-key)"
         if reason is None:
             return True
         self.close_connection = True  # the request body is not read, so the connection cannot be reused
-        self._send_json(403, anthropic_error(403, reason), extra={"Connection": "close"})
+        self._send_json(status, anthropic_error(status, reason), extra={"Connection": "close"})
         return False
+
+    def _key_ok(self) -> bool:
+        want = self.server.auth_token.encode()
+        auth = self.headers.get("Authorization") or ""
+        keys = [self.headers.get("x-api-key") or "", auth[7:].strip() if auth[:7].lower() == "bearer " else ""]
+        ok = False
+        for k in keys:  # no short-circuit: compare both in constant time
+            ok |= bool(k) and hmac.compare_digest(k.encode(), want)
+        return ok
 
     def _send_raw(self, status: int, body: bytes, ctype: str = "application/json; charset=utf-8",
                   extra: Optional[dict[str, str]] = None) -> None:
@@ -1197,9 +1440,63 @@ class Handler(BaseHTTPRequestHandler):
         except OSError:
             pass
 
-    def _read_json(self, anthropic: bool = True) -> Optional[dict[str, Any]]:
-        n = int(self.headers.get("Content-Length") or 0)
+    def _read_body(self, anthropic: bool = True) -> Optional[bytes]:
+        """Content-Length or chunked body, at most MAX_BODY bytes; None after sending an error."""
+        te = [t.strip().lower() for h in (self.headers.get_all("Transfer-Encoding") or []) for t in h.split(",")]
+        if te and te[-1] == "chunked":
+            parts, total = [], 0
+            while True:
+                line = self.rfile.readline(1024)
+                try:
+                    if not line.endswith(b"\n"):
+                        raise ValueError("chunk-size line too long or truncated")
+                    field = line.split(b";")[0].strip()
+                    if not field or not all(ch in b"0123456789abcdefABCDEF" for ch in field):
+                        raise ValueError("bad chunk size")
+                    size = int(field, 16)
+                except ValueError:
+                    self.close_connection = True
+                    self._fail(400, "Malformed chunked body", anthropic)
+                    return None
+                if size == 0:
+                    for _ in range(64):  # trailers, bounded
+                        if self.rfile.readline(1024) in (b"\r\n", b"\n", b""):
+                            break
+                    else:
+                        self.close_connection = True  # unread trailers: do not reuse the connection
+                    return b"".join(parts)
+                total += size
+                if total > MAX_BODY:
+                    self.close_connection = True
+                    self._fail(413, f"Request body over {MAX_BODY} bytes", anthropic)
+                    return None
+                data = self.rfile.read(size)
+                if len(data) != size or self.rfile.readline(8) not in (b"\r\n", b"\n"):
+                    self.close_connection = True
+                    self._fail(400, "Truncated chunked body", anthropic)
+                    return None
+                parts.append(data)
+        if te:  # a transfer coding other than chunked last: cannot frame the body
+            self.close_connection = True
+            self._fail(400, "Unsupported Transfer-Encoding", anthropic)
+            return None
+        values = {v.strip() for v in (self.headers.get_all("Content-Length") or [])}
+        n = int(next(iter(values))) if len(values) == 1 and next(iter(values)).isdigit() else (0 if not values else -1)
+        if n < 0 or n > MAX_BODY:
+            self.close_connection = True
+            self._fail(413 if n > MAX_BODY else 400, f"Bad or too large Content-Length (max {MAX_BODY})", anthropic)
+            return None
         raw = self.rfile.read(n) if n > 0 else b""
+        if len(raw) != n:
+            self.close_connection = True
+            self._fail(400, "Truncated request body", anthropic)
+            return None
+        return raw
+
+    def _read_json(self, anthropic: bool = True) -> Optional[dict[str, Any]]:
+        raw = self._read_body(anthropic)
+        if raw is None:
+            return None
         try:
             body = json.loads(raw.decode("utf-8")) if raw else {}
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -1308,9 +1605,8 @@ class Handler(BaseHTTPRequestHandler):
         elif path in ("/v1/embeddings", "/embeddings"):
             self._passthrough("/embeddings")
         else:
-            n = int(self.headers.get("Content-Length") or 0)
-            if n:
-                self.rfile.read(n)
+            if self._read_body() is None:
+                return
             self._send_json(404, anthropic_error(404, f"Not found: {path}"))
 
     # -- endpoints -------------------------------------------------------------
@@ -1419,12 +1715,46 @@ class Handler(BaseHTTPRequestHandler):
                  stream, "agent" if agent else "user", vision, len(body.get("messages", [])),
                  len(body.get("tools") or []))
         log = dict(route="native", model=model, stream=stream, initiator="agent" if agent else "user")
+        headers = self._native_headers()
+        if "context_management" in body:
+            LOG.debug("client context_management: %s", json.dumps(body["context_management"])[:500])
+        own_cm = body.get("context_management")
+        cm = None if model in self.server.no_context_edit else context_management_for(body, self.server.context_edit)
+        if cm:
+            body["context_management"] = cm
+            betas = [b.strip() for b in headers.get("anthropic-beta", "").split(",") if b.strip()]
+            if CONTEXT_MANAGEMENT_BETA not in betas:
+                headers["anthropic-beta"] = ",".join(betas + [CONTEXT_MANAGEMENT_BETA])
+            log["context_edit"] = self.server.context_edit
         conn = None
         try:
-            conn, resp = self._copilot("/v1/messages", body, agent, vision, self._native_headers())
+            conn, resp = self._copilot("/v1/messages", body, agent, vision, headers)
+            if cm and resp.status == 400:
+                raw = resp.read()
+                if not _context_edit_refused(resp.status, raw):
+                    resp = _Replay(resp, raw)
+                else:
+                    # send the client's own request once more, as it would have gone without the proxy's edit;
+                    # stop adding the edit for this model only when Copilot says the strategy is unsupported
+                    # (the same recovery Claude Code uses)
+                    LOG.warning("Copilot rejected the added context_management for %s (%s); resending without it",
+                                model, raw[:200])
+                    if any(s in raw.lower() for s in (b"does not support", b"not supported", b"unsupported")):
+                        self.server.no_context_edit.add(model)
+                    conn.close()
+                    if own_cm is None:
+                        body.pop("context_management", None)
+                    else:
+                        body["context_management"] = own_cm
+                    log["context_edit"] = "rejected"
+                    conn, resp = self._copilot("/v1/messages", body, agent, vision, self._native_headers())
             if resp.status != 200 or not stream:
                 raw = resp.read()
-                usage = _dict_get(_json_or_none(raw), "usage")
+                parsed = _json_or_none(raw)
+                usage = _dict_get(parsed, "usage")
+                cleared = cleared_input_tokens(parsed)
+                if cleared:
+                    log["cleared_input_tokens"] = cleared
                 if resp.status != 200:
                     LOG.warning("Copilot native error %d: %s", resp.status, raw[:500])
                 if self.server.mode == "auto" and _route_unsupported(resp.status, raw):
@@ -1443,6 +1773,10 @@ class Handler(BaseHTTPRequestHandler):
                 if not line:
                     break
                 self._chunk(line)
+                if line.startswith(b"data:") and b'"context_management"' in line:
+                    cleared = cleared_input_tokens(_json_or_none(line[5:].strip()))
+                    if cleared:
+                        log["cleared_input_tokens"] = cleared
                 if line.startswith(b"data:") and b'"usage"' in line:
                     ev = _json_or_none(line[5:].strip())
                     if ev.get("type") == "message_start":
@@ -1578,7 +1912,8 @@ def resolve_github_token(args: argparse.Namespace) -> str:
 
 
 def claude_code_env(base: str, catalog: ModelCatalog, primary: Optional[str], small: Optional[str],
-                    subagent: Optional[str] = None) -> dict[str, str]:
+                    subagent: Optional[str] = None, unix_socket: Optional[str] = None,
+                    auth_token: Optional[str] = None) -> dict[str, str]:
     """Claude Code settings for this proxy. Variable names checked against the Claude Code 2.1.330 binary."""
     sonnet = catalog.resolve_model(primary) if primary else (catalog.newest("sonnet") or PREFERRED_MODELS["sonnet"])
     haiku = catalog.resolve_model(small) if small else (catalog.newest("haiku") or sonnet)
@@ -1586,7 +1921,8 @@ def claude_code_env(base: str, catalog: ModelCatalog, primary: Optional[str], sm
     subagent = catalog.resolve_model(subagent) if subagent else None
     env = {
         "ANTHROPIC_BASE_URL": base,
-        "ANTHROPIC_AUTH_TOKEN": "dummy",
+        **({"ANTHROPIC_UNIX_SOCKET": unix_socket} if unix_socket else {}),
+        "ANTHROPIC_AUTH_TOKEN": auth_token or "dummy",
         "ANTHROPIC_MODEL": sonnet,
         "ANTHROPIC_DEFAULT_SONNET_MODEL": sonnet,
         "ANTHROPIC_DEFAULT_OPUS_MODEL": opus,
@@ -1601,6 +1937,128 @@ def claude_code_env(base: str, catalog: ModelCatalog, primary: Optional[str], sm
         # compact against Copilot's real prompt limit, not the model's native window
         env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] = str(window)
     return env
+
+
+def secret_paths(args: argparse.Namespace) -> list[str]:
+    """Files that hold the GitHub login. Claude Code's sandboxed commands can read the whole disk by default."""
+    paths = [args.token_file] + ([] if getattr(args, "no_copilot_config", False) else [args.copilot_config_dir])
+    out: list[str] = []
+    for p in paths:
+        for q in sorted(_both(p)):
+            if q not in out:
+                out.append(q)
+    return out
+
+
+def sandbox_settings(args: argparse.Namespace) -> dict[str, Any]:
+    """Claude Code settings that keep the GitHub login and the proxy away from what the model runs:
+    - sandbox.filesystem.denyRead: sandboxed Bash commands cannot read the login files (the default lets them
+      read the whole disk);
+    - permissions.deny Read(//...): the built-in Read tool runs outside the sandbox, so it needs its own rule;
+    - CLAUDE_CODE_SUBPROCESS_ENV_SCRUB (added to env): Bash, hooks and MCP servers do not inherit the proxy key;
+    - no allowedDomains / allowUnixSockets entry for the proxy, so a sandboxed command cannot spend the Copilot
+      account. Claude Code's own model calls run outside the sandbox and are not affected."""
+    paths = secret_paths(args)
+    deny = []
+    for p in paths:
+        deny += [f"Read(/{p})", f"Read(/{p}/**)"]  # '//' = absolute path in permission rules
+    return {"permissions": {"deny": deny},
+            "sandbox": {"enabled": True, "failIfUnavailable": True, "allowUnsandboxedCommands": False,
+                        "filesystem": {"denyRead": paths}}}
+
+
+def real_home() -> str:
+    """The account's home from the password database: $HOME can be overridden to point anywhere."""
+    try:
+        import pwd
+        return os.path.realpath(pwd.getpwuid(os.getuid()).pw_dir)
+    except (ImportError, KeyError):
+        return os.path.realpath(os.path.expanduser("~"))
+
+
+def _both(path: str) -> set[str]:
+    """A path as given and with symlinks resolved (Seatbelt and permission rules match either literally)."""
+    a = os.path.abspath(os.path.expanduser(path))
+    return {a, os.path.realpath(a)}
+
+
+def _sb_quote(path: str) -> str:
+    return '"' + path.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def self_sandbox_profile(args: argparse.Namespace) -> str:
+    """macOS Seatbelt profile for the proxy itself: no access to the home directory except what it needs (its
+    script, its GitHub login, its usage log, its socket), so a bug in the proxy cannot read ~/.ssh and the like."""
+    home = real_home()
+    script = os.path.realpath(os.path.abspath(sys.argv[0]))
+    python = os.path.realpath(sys.executable)
+    prefixes = {os.path.realpath(p) for p in (sys.prefix, sys.base_prefix, sys.exec_prefix)}
+    # only the script file itself: its directory may be the home directory (python runs with -I, so the script
+    # directory is not on sys.path)
+    read = {script} | prefixes
+    for p in secret_paths(args):
+        read |= _both(p)
+    rw = _both(os.path.dirname(os.path.abspath(os.path.expanduser(args.token_file))))
+    if getattr(args, "usage_log", None):
+        rw |= _both(args.usage_log)
+    if getattr(args, "unix_socket", None):
+        rw |= _both(os.path.dirname(os.path.abspath(os.path.expanduser(args.unix_socket))))
+    for d in read | rw:
+        if d == home or home.startswith(d.rstrip("/") + "/"):
+            raise SystemExit(f"--sandbox-self: {d} would open the whole home directory; put the token file, "
+                             "socket and usage log in a subdirectory (the defaults do)")
+    # stat() on the directories between the home directory and each allowed path (not their contents)
+    ancestors = {home}
+    for path in read | rw:
+        cur = os.path.dirname(path)
+        while cur.startswith(home + "/"):
+            ancestors.add(cur)
+            cur = os.path.dirname(cur)
+    sub = lambda ps: " ".join(f"(subpath {_sb_quote(p)})" for p in sorted(ps))
+    lit = lambda ps: " ".join(f"(literal {_sb_quote(p)})" for p in sorted(ps))
+    return "\n".join([
+        "(version 1)",
+        "(allow default)",
+        f"(deny file-read* file-write* (subpath {_sb_quote(home)}))",
+        f"(allow file-read* file-read-metadata {sub(read | rw)})",
+        f"(allow file-write* {sub(rw)})",
+        f"(allow file-read-metadata {lit(ancestors)})",
+        # the proxy starts no programs: only the interpreter (a framework build re-executes inside its prefix)
+        "(deny process-exec*)",
+        f"(allow process-exec* (literal {_sb_quote(python)}) {sub(prefixes)})",
+    ])
+
+
+def _home_unreadable() -> bool:
+    try:
+        os.listdir(real_home())
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+
+
+def reexec_sandboxed(args: argparse.Namespace) -> None:
+    if os.environ.get("COPILOT_PROXY_SANDBOXED") == "1":
+        if not _home_unreadable():  # the variable alone proves nothing
+            raise SystemExit("--sandbox-self: COPILOT_PROXY_SANDBOXED is set but the home directory is readable; "
+                             "not running inside the sandbox")
+        return
+    if sys.platform != "darwin" or not Path("/usr/bin/sandbox-exec").exists():
+        raise SystemExit("--sandbox-self needs macOS sandbox-exec. On Linux, run the proxy under bwrap; see README.")
+    profile = self_sandbox_profile(args)
+    # create the writable directories now: inside the sandbox their missing parents cannot be created
+    private_dir(Path(args.token_file).expanduser().absolute().parent)
+    if getattr(args, "unix_socket", None):
+        private_dir(Path(args.unix_socket).expanduser().absolute().parent)
+    if getattr(args, "usage_log", None):
+        Path(args.usage_log).expanduser().absolute().parent.mkdir(parents=True, exist_ok=True)
+    LOG.debug("sandbox profile:\n%s", profile)
+    argv = [a for a in sys.argv[1:] if a != "--sandbox-self"] + ["--sandbox-self"]  # child re-checks (above)
+    os.environ["COPILOT_PROXY_SANDBOXED"] = "1"
+    os.execv("/usr/bin/sandbox-exec", ["sandbox-exec", "-p", profile, os.path.realpath(sys.executable), "-I",
+                                        os.path.realpath(os.path.abspath(sys.argv[0])), *argv])
 
 
 def cmd_auth(args: argparse.Namespace) -> None:
@@ -1632,33 +2090,80 @@ def cmd_check_usage(args: argparse.Namespace) -> None:
 
 
 def cmd_start(args: argparse.Namespace) -> None:
+    if args.context_edit not in CONTEXT_EDIT_MODES:  # an env default is not checked by argparse
+        raise SystemExit(f"--context-edit / COPILOT_PROXY_CONTEXT_EDIT must be one of {', '.join(CONTEXT_EDIT_MODES)}")
+    if args.unix_socket and not hasattr(socketserver, "UnixStreamServer"):
+        raise SystemExit("--unix-socket is not available on this platform")
+    if args.sandbox_self:
+        reexec_sandboxed(args)  # does not return unless already inside the sandbox
+    elif os.environ.get("COPILOT_PROXY_SANDBOXED") == "1" and not _home_unreadable():
+        os.environ.pop("COPILOT_PROXY_SANDBOXED")  # a stray variable must not make the banner claim a sandbox
+    auth = args.auth_token
+    if auth == "auto":
+        auth = secrets.token_urlsafe(24)
     tm = TokenManager(resolve_github_token(args), account_type=args.account_type, show_token=args.show_token)
     tm.start_background_refresh()
     catalog = ModelCatalog(tm, primary=args.model, small=args.small_model)
     catalog.get_models_payload(force=True)
     ids = catalog.chat_model_ids()
     guard = RequestGuard(args.rate_limit, args.wait, args.manual)
-    server = ProxyServer((args.host, args.port), tm, catalog, guard, args.show_token,
-                         mode=args.mode, count_mode=args.count_tokens, usage=UsageLog(args.usage_log))
+    kw = dict(mode=args.mode, count_mode=args.count_tokens, usage=UsageLog(args.usage_log))
+    if args.unix_socket:
+        server: Any = UnixProxyServer(args.unix_socket, tm, catalog, guard, args.show_token, **kw)
+        sock = str(server.socket_path)
+        base = "http://localhost"
+    else:
+        server = ProxyServer((args.host, args.port), tm, catalog, guard, args.show_token, **kw)
+        sock = None
+        shown = f"[{args.host}]" if ":" in args.host and not args.host.startswith("[") else args.host
+        base = f"http://{shown}:{args.port}"
     server.cors_origins = set(args.cors_origin or [])
     server.allowed_hosts |= {h for h in (host_name(a) for a in (args.allow_host or [])) if h}
-    if not server.check_host:
+    server.auth_token = auth or None
+    server.context_edit = args.context_edit
+    if not server.check_host and not sock:
         LOG.warning("Bound to %s: any Host is accepted and anyone who can reach this port uses your Copilot account",
                     args.host)
 
-    shown = f"[{args.host}]" if ":" in args.host and not args.host.startswith("[") else args.host
-    base = f"http://{shown}:{args.port}"
-    print(f"\nCopilot proxy listening on {base}")
-    print(f"Upstream: {tm.api_base_url}")
+    print(f"\nCopilot proxy listening on {'unix socket ' + sock if sock else base}"
+          + (" (inside macOS sandbox-exec)" if os.environ.get("COPILOT_PROXY_SANDBOXED") == "1" else ""))
+    via = upstream_proxy("https", urllib.parse.urlsplit(tm.api_base_url).hostname or "")
+    print(f"Upstream: {tm.api_base_url}" + (f" via HTTP proxy {via[0]}:{via[1]}" if via else ""))
     native = [m for m in ids if catalog.supports_endpoint(m, "/v1/messages")]
     print(f"Messages route: {args.mode} (native /v1/messages models: {', '.join(native) or 'none'}); "
-          f"count_tokens: {args.count_tokens}" + (f"; usage log: {args.usage_log}" if args.usage_log else ""))
+          f"count_tokens: {args.count_tokens}; context editing: {args.context_edit}"
+          + (f" (above {CLEAR_TRIGGER} input tokens, clear old tool results in steps of {CLEAR_STEP}, "
+             f"keep at least {CLEAR_KEEP})"
+             if args.context_edit in ("tools", "both") else "")
+          + (f"; usage log: {args.usage_log}" if args.usage_log else ""))
+    print("Client key: " + ("required" if auth else "none (socket is mode 0600: only your user can connect)" if sock
+                            else "none (any local process can use this proxy; see --auth-token)"))
     print(f"Chat models ({len(ids)}): {', '.join(ids)}")
     if args.claude_code:
-        env = claude_code_env(base, catalog, args.model, args.small_model, args.subagent_model)
-        print("\nRun Claude Code in another terminal:\n  " + " ".join(f"{k}={v}" for k, v in env.items()) + " claude")
-        print("\nOr put this in .claude/settings.json:\n" + json.dumps({"env": env}, indent=2))
+        env = claude_code_env(base, catalog, args.model, args.small_model, args.subagent_model, sock, auth)
+        if args.sandbox:
+            env["CLAUDE_CODE_SUBPROCESS_ENV_SCRUB"] = "1"
+        print("\nRun Claude Code in another terminal:\n  " + " ".join(f"{k}={shlex.quote(v)}" for k, v in env.items())
+              + " claude")
+        # Measured with Claude Code 2.1.330: the socket and its connection settings must be in the shell
+        # environment; from settings.json "env" they apply too late (connection refused / TLS on the socket)
+        shell_only = ("ANTHROPIC_UNIX_SOCKET", "ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN") if sock else ()
+        settings: dict[str, Any] = {"env": {k: v for k, v in env.items() if k not in shell_only}}
+        if args.sandbox:
+            settings.update(sandbox_settings(args))
+        if sock:
+            print("\nOr export these in the shell (they do not work from settings.json):\n  export "
+                  + " ".join(f"{k}={shlex.quote(env[k])}" for k in shell_only))
+        print(("\nand put this in" if sock else "\nOr put this in") + " .claude/settings.json"
+              + (" (keep it out of git: it holds the proxy key)" if auth and not sock else "")
+              + ":\n" + json.dumps(settings, indent=2))
+    elif auth:
+        print("\nClient key (send as Authorization: Bearer or x-api-key):", auth)
     print("\nCtrl+C to stop.\n", flush=True)
+
+    def on_term(signum: int, frame: Any) -> None:
+        raise KeyboardInterrupt  # same clean shutdown as Ctrl+C (removes the Unix socket)
+    signal.signal(signal.SIGTERM, on_term)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -1710,6 +2215,25 @@ def build_parser() -> argparse.ArgumentParser:
                    help="auto: exact count from Copilot when the model supports it, else a local estimate")
     s.add_argument("--usage-log", default=os.environ.get("COPILOT_PROXY_USAGE_LOG"),
                    help="append one JSON line per request (tokens, cache hits, route, ms) to this file")
+    s.add_argument("--context-edit", choices=CONTEXT_EDIT_MODES,
+                   default=os.environ.get("COPILOT_PROXY_CONTEXT_EDIT", "tools"),
+                   help="server-side context editing on the native Claude route, as the official Copilot client "
+                        "does: tools = clear old tool results once a request passes COPILOT_PROXY_CLEAR_TRIGGER "
+                        "(100000) input tokens, in steps of COPILOT_PROXY_CLEAR_STEP (10) tool uses so the prompt "
+                        "cache survives between steps, keeping at least COPILOT_PROXY_CLEAR_KEEP (3); thinking = "
+                        "drop old thinking blocks (needs thinking on); both; off")
+    s.add_argument("--unix-socket", default=os.environ.get("COPILOT_PROXY_UNIX_SOCKET"),
+                   help="listen on this Unix socket (mode 0600) instead of TCP; Claude Code connects with "
+                        "ANTHROPIC_UNIX_SOCKET. No port for other processes or sandboxed commands to reach")
+    s.add_argument("--auth-token", default=os.environ.get("COPILOT_PROXY_AUTH_TOKEN"),
+                   help="require this client key (Authorization: Bearer or x-api-key) on every route except "
+                        "/health; 'auto' generates one and prints it in the Claude Code env")
+    s.add_argument("--sandbox", action="store_true",
+                   help="with -c: also print the Claude Code sandbox block that hides the GitHub login from "
+                        "sandboxed commands")
+    s.add_argument("--sandbox-self", action="store_true",
+                   help="macOS: run the proxy under sandbox-exec with no access to your home directory except its "
+                        "own files")
     s.set_defaults(func=cmd_start)
 
     a = sub.add_parser("auth", help="Run the GitHub device login and save the token")
