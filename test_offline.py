@@ -13,7 +13,10 @@ import http.client
 import json
 import os
 import socket
+import shutil
+import ssl
 import stat
+import subprocess
 import sys
 import tempfile
 import threading
@@ -219,6 +222,22 @@ def raw_call(proxy: Any, request: bytes) -> int:
         except OSError:
             return 0
     return int(head.split()[1]) if head.startswith(b"HTTP/") else 0
+
+
+def raw_exchange(proxy: Any, request: bytes, quiet: float = 1.5) -> bytes:
+    """Send raw bytes; everything the proxy answers until it closes the connection or stays quiet."""
+    out = b""
+    with socket.create_connection(("127.0.0.1", proxy.server_address[1]), timeout=quiet) as s:
+        s.sendall(request)
+        try:
+            while True:
+                data = s.recv(65536)
+                if not data:
+                    break
+                out += data
+        except OSError:
+            pass
+    return out
 
 
 def msg(model: str = NATIVE, **extra: Any) -> dict[str, Any]:
@@ -897,6 +916,102 @@ def default_mode_55(ck: Check, base: str) -> None:
     ck("D8 account without 5.5: Copilot's refusal comes back readable, with the way out", (
         s, text.startswith("The requested model is not supported. (model_not_supported)"), "--any-model" in text,
         "it lists claude-sonnet-5.5" in text, "\\" in text), (400, True, True, True, False))
+
+
+@group
+def security_controls(ck: Check, base: str) -> None:
+    """The controls that held in the security scan of 2026-11-26; they must keep holding."""
+    import io
+    p = start_proxy(base)
+    port = p.server_address[1]
+    body = json.dumps(msg()).encode()
+    post = b"POST /v1/messages HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: %d\r\n" % len(body)
+
+    def get(host: Optional[str], version: bytes = b"HTTP/1.1") -> int:
+        lines = [b"GET /v1/models " + version] + ([] if host is None else [b"Host: " + host.encode()])
+        return raw_call(p, b"\r\n".join(lines) + b"\r\n\r\n")
+
+    foreign = ["evil.example", "127.0.0.1.evil.example", "localhost.evil.example", "evil.example:%d" % port,
+               "127.0.0.1:%d@evil.example" % port, "127.1", "0.0.0.0", "[::ffff:127.0.0.1]", "",
+               "127.0.0.1 evil.example", "evil.example#127.0.0.1"]
+    ck("SC1 Host: 11 foreign or malformed values, a missing header and a foreign first of two are refused",
+       (sorted({get(h) for h in foreign}), get(None, b"HTTP/1.0"),
+        raw_call(p, b"GET /v1/models HTTP/1.1\r\nHost: evil.example\r\nHost: 127.0.0.1\r\n\r\n")),
+       ([403], 403, 403))
+    ck("SC2 Host: the proxy's own names still work",
+       [get(h) for h in ("127.0.0.1:%d" % port, "LOCALHOST", "localhost.", "[::1]:%d" % port)], [200] * 4)
+    mark = len(STATE["seen"])
+    origins = [raw_call(p, post + b"Host: 127.0.0.1\r\nOrigin: " + o.encode() + b"\r\n\r\n" + body)
+               for o in ("https://evil.example", "null", "http://127.0.0.1:%d" % port)]
+    ck("SC3 Origin: a browser POST from a foreign, null or even the proxy's own origin is refused, unsent",
+       (origins, len(seen_since(mark))), ([403] * 3, 0))
+    p.auth_token = "k3y-0123456789"
+    try:
+        def keyed(*headers: bytes, path: bytes = b"/v1/messages") -> int:
+            return raw_call(p, post.replace(b"/v1/messages", path, 1) + b"Host: 127.0.0.1\r\n"
+                            + b"".join(h + b"\r\n" for h in headers) + b"\r\n" + body)
+        ck("SC4 client key: missing, wrong, empty, Basic or in the URL is refused; the right one works in both headers",
+           [keyed(), keyed(b"x-api-key: wrong"), keyed(b"Authorization: Bearer "),
+            keyed(b"Authorization: Basic k3y-0123456789"), keyed(path=b"/v1/messages?key=k3y-0123456789"),
+            keyed(b"x-api-key: k3y-0123456789"), keyed(b"Authorization: bearer k3y-0123456789")],
+           [401, 401, 401, 401, 401, 200, 200])
+    finally:
+        p.auth_token = None
+    start = b"GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+    ck("SC5 limits: 150 headers, a 70 KB header and a 70 KB request line are refused",
+       (raw_call(p, start + b"".join(b"X-%d: 1\r\n" % i for i in range(150)) + b"\r\n"),
+        raw_call(p, start + b"X-Big: " + b"a" * 70000 + b"\r\n\r\n"),
+        raw_call(p, b"GET /" + b"a" * 70000 + b" HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")), (431, 431, 414))
+    mark = len(STATE["seen"])
+    answers = raw_exchange(p, post + b"Host: evil.example\r\n\r\n" + body + post + b"Host: 127.0.0.1\r\n\r\n" + body)
+    ck("SC6 a request pipelined behind a refused one is not processed",
+       (answers.count(b"HTTP/1.1 "), len(seen_since(mark))), (1, 0))
+    raw_call(p, post + b"Host: 127.0.0.1\r\nanthropic-beta: a-1\r\n\tX-Evil: 1\r\n"
+             b"Authorization: Bearer client-key\r\nCookie: sid=1\r\nx-api-key: client-key\r\n\r\n" + body)
+    sent = {k.lower(): v for k, v in STATE["seen"][-1][2].items()}
+    ck("SC7 a folded header adds no header upstream; the client's own credentials are not forwarded",
+       ("x-evil" in sent, "cookie" in sent, "x-api-key" in sent, sent.get("authorization")),
+       (False, False, False, "Bearer copilot-test"))
+    hostile = Namespace(token_file='/tmp/a") (allow default) ("/tok', copilot_config_dir="/tmp/cfg",
+                        no_copilot_config=False, usage_log=None, unix_socket=None)
+    profile = cp.self_sandbox_profile(hostile)
+    ck("SC8 --sandbox-self: a path with quotes cannot add a rule to the sandbox profile",
+       ('a") (allow default)' in profile.replace('\\"', ""), 'a\\") (allow default) (\\"' in profile), (False, True))
+    buf = io.StringIO()
+    handler = cp.logging.StreamHandler(buf)
+    cp.LOG.addHandler(handler)
+    cp.logging.disable(cp.logging.NOTSET)
+    level, cp.LOG.level = cp.LOG.level, cp.logging.DEBUG
+    try:
+        STATE["script"] = ["401", "", "429"]  # one entry per upstream request: 401, its retry, then a 429
+        codes = [call(p, "POST", "/v1/messages", msg())[0], call(p, "POST", "/v1/messages", msg(CHAT))[0],
+                 call(p, "GET", "/v1/models")[0],
+                 call(p, "POST", "/v1/messages/count_tokens", {"model": NATIVE, "messages": USER})[0]]
+        text = buf.getvalue()
+    finally:
+        cp.logging.disable(cp.logging.CRITICAL)
+        cp.LOG.removeHandler(handler)
+        cp.LOG.level = level
+    ck("SC9 no token in the log at debug level (normal answers, a 401 with token refresh, a 429)",
+       (codes, text.count("\n") > 8, "copilot-test" in text, "gh-test" in text),
+       ([200, 429, 200, 200], True, False, False))
+    openssl = shutil.which("openssl")  # only needed to make a throw-away certificate
+    if openssl:
+        with tempfile.TemporaryDirectory() as tmp:
+            cert, key = os.path.join(tmp, "c.pem"), os.path.join(tmp, "k.pem")
+            subprocess.run([openssl, "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", key, "-out", cert,
+                            "-days", "1", "-subj", "/CN=127.0.0.1"], check=True, capture_output=True)
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            context.load_cert_chain(cert, key)
+            tls = ThreadingHTTPServer(("127.0.0.1", 0), Upstream)
+            tls.socket = context.wrap_socket(tls.socket, server_side=True)
+            serve(tls)
+            mark = len(STATE["seen"])
+            mitm = start_proxy("https://127.0.0.1:%d" % tls.server_address[1], load=False)
+            status, _, answer = call(mitm, "POST", "/v1/messages", msg(CHAT))
+            ck("SC10 TLS: an upstream with a self-signed certificate is refused and gets nothing",
+               (status, "CERTIFICATE_VERIFY_FAILED" in answer, len(seen_since(mark))), (502, True, 0))
+            tls.shutdown()
 
 
 @group

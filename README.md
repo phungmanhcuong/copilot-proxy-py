@@ -227,6 +227,8 @@ On TCP, use `--auth-token auto` if other local programs shouldn't use your accou
 the environment also reaches the commands Claude Code runs; `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1` removes it there.
 
 ## Security
+The full guide is [SECURITY.md](SECURITY.md): who can reach the proxy, six ways to run it safely, every control and
+its switch, what the proxy keeps, the scan of 26 Nov 2026 and how to check it yourself. In short:
 - The proxy binds to `127.0.0.1` by default.
 - Requests whose `Host` isn't `127.0.0.1`, `localhost` or `[::1]` get 403. This blocks DNS rebinding. Add names
   with `--allow-host`.
@@ -250,7 +252,7 @@ the environment also reaches the commands Claude Code runs; `CLAUDE_CODE_SUBPROC
   every website with `Access-Control-Allow-Origin: *`.
 
 A scan of 26 Nov 2026 (static analysis, the git history, 28 live probes) found no high-severity issue in the
-code; its low findings are fixed and each has a check in `test_offline.py` (group `hardening`).
+code. Its findings are fixed, and `python3 test_offline.py security hardening` runs the 21 checks that cover them.
 
 ## Endpoints
 - `POST /v1/messages`: Anthropic Messages, with or without streaming
@@ -278,6 +280,29 @@ Every failure gets an answer; the proxy doesn't close the connection without one
   error object inside Copilot's stream and a stream that ends before its finish reason.
 - Text cut in the middle of an emoji (half a surrogate pair) is forwarded as it arrived.
 
+## Troubleshooting
+
+| What you see | Cause | What to do |
+|---|---|---|
+| 403 `Host '...' not allowed (use --allow-host)` | The request names a host the proxy does not know (protection against DNS rebinding) | Call it as `127.0.0.1` or `localhost`, or add the name: `--allow-host my-name` |
+| 403 `Origin '...' not allowed (use --cors-origin)` or `Browser request from another site not allowed` | The request comes from a web page | For your own web client: `--cors-origin https://your.app`. Never `'*'` |
+| 401 `Missing or wrong proxy key` | The proxy runs with `--auth-token` and the client did not send the key | Set `ANTHROPIC_AUTH_TOKEN` to the key (`-c` prints it), or send `x-api-key: KEY` |
+| 403 `Disabled. Start with --show-token to enable.` or `GET /token needs a client key` | `/token` is off unless you ask for it, and never open without a key on TCP | `--show-token` together with `--auth-token` or `--unix-socket`; avoid it on shared machines |
+| 400 `The requested model is not supported. (model_not_supported) This Copilot account does not serve ...` | The default mode uses only the three Claude 5.5 models and your account does not have that one | Start with `--any-model`; the message lists the Claude models your account has |
+| 400 `model ...: only ... are enabled` on `/v1/chat/completions` or `/v1/responses` | The same default, on the OpenAI routes | `--any-model` |
+| 400 `messages: must be a list`, `max_tokens: must be a positive integer`, `Invalid JSON body` | The request itself is malformed | Fix the client |
+| 400 `Content-Length and Transfer-Encoding together` | A client or a server in front sends both | Send one of them |
+| 408 `No request data for 120 s` | The client stopped in the middle of its request | A very slow upload: raise `COPILOT_PROXY_CLIENT_TIMEOUT` (seconds) |
+| 413 `Request body over ... bytes` or `more than 2000000 JSON items` | The request is over the limits | Send less: clear or compact the session |
+| 429 `Local rate limit. Retry after ...` | You started with `-r SECONDS` | Add `-w` to wait instead, or lower `-r` |
+| 502 `Upstream error` or `Upstream connection error` | GitHub or Copilot could not be reached, or the login was refused | Check the network and `HTTPS_PROXY`; if the message names the token exchange, log in again: `python3 copilot_proxy.py auth` |
+| `event: error` at the end of a stream | Copilot failed after the answer had started | Retry; the message carries Copilot's reason |
+| `copilot_proxy: cannot listen on 127.0.0.1:4141: Address already in use` | Another copy is running | `lsof -nP -iTCP:4141 -sTCP:LISTEN`, stop that copy, or pick another port with `-p` |
+| `copilot_proxy: refusing to listen on ... without a client key` | A host other than a loopback address needs a key | `--auth-token auto`, or better an SSH tunnel; see [SECURITY.md](SECURITY.md) |
+| Claude Code: `API Error: 400 ... does not support reasoning effort` or `adaptive thinking is not supported` | A copy from before commit `a35abc5` is running; it did not fit the request to the model | Update and restart |
+| Claude Code cannot connect in Unix-socket mode | The socket variables were put in `settings.json` | Export `ANTHROPIC_UNIX_SOCKET`, `ANTHROPIC_BASE_URL` and `ANTHROPIC_AUTH_TOKEN` in the shell; `-c` prints the line |
+| The quota drops faster than expected | A model name the account does not list falls back to Sonnet with `--any-model`; subagents start billed prompts | Pin the models with `-m` and `-s`, set `--subagent-model`, and read `GET /stats` or the usage log (`initiator` says who started each request) |
+
 ## Notes
 - On the translated route (non-Claude models), Anthropic `thinking` blocks in the history are dropped, because the
   OpenAI format has no field for them. Anthropic server tools (for example `web_search`) are not forwarded. The
@@ -288,7 +313,7 @@ Every failure gets an answer; the proxy doesn't close the connection without one
   (`{"role": "system", "content": [], "output_config": {...}}`, sent right after the prompt) never changes it.
 
 ## Tests
-`python3 test_offline.py` runs 109 checks against a fake Copilot upstream on 127.0.0.1. It needs no network, login or
+`python3 test_offline.py` runs 119 checks against a fake Copilot upstream on 127.0.0.1. It needs no network, login or
 Copilot quota, and passes on Python 3.9 to 3.12. `python3 test_offline.py stream pool` runs only the groups whose
 name contains one of the words.
 
@@ -303,6 +328,7 @@ name contains one of the words.
 | Connection reuse, IPv6 and Unix-socket listeners | 7 |
 | Default mode end to end: an account that serves the three Claude 5.5 models, and one that doesn't | 8 |
 | Security hardening: log and prompt text, client timeout, body limits, cross-site GET, `/token`, framing, API address | 11 |
+| Security controls that held in the scan: Host, Origin, client key, limits, header and profile injection, tokens in logs, TLS | 10 |
 
 ## License
 MIT. See `LICENSE`.
