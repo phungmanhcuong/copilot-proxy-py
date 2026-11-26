@@ -125,6 +125,9 @@ class Upstream(BaseHTTPRequestHandler):
             return self._json(404, {"error": "unknown endpoint"})
         if step == "400":
             return self._json(400, {"error": {"message": "prompt is too long"}})
+        if step == "unsupported":
+            return self._json(400, {"error": {"message": "The requested model is not supported.",
+                                              "code": "model_not_supported", "param": "model"}})
         if step == "cm-refused" and "context_management" in body:
             return self._json(400, {"error": {"message": "context_management: Extra inputs are not permitted"}})
         if step == "cm-unsupported" and "context_management" in body:
@@ -806,9 +809,94 @@ def model_fit(ck: Check, base: str) -> None:
        (a["messages"] == tool_history(1), a["betas"], b["messages"] == per_turn("medium"), b["betas"],
         c["messages"] == per_turn("high")),
        (True, "a-1,effort-2025-11-24", True, "a-1,per-turn-control-2026-07-01,effort-2025-11-24", True))
-    ck("X10 a tool follow-up stays agent-initiated when a per-turn message follows the tool result",
-       (a["initiator"], b["initiator"], cp.anthropic_flags({"messages": per_turn("medium")})),
-       ("agent", "agent", (True, False)))
+    # the order Claude Code 2.1.332 sends (measured): prompt, per-turn message, tool call, tool result
+    real = USER + per_turn("medium")[-1:] + tool_history(1)[1:]
+    ck("X10 a tool follow-up stays agent-initiated wherever the per-turn message sits (after the prompt, or last)",
+       (sent(sonnet, messages=real)["initiator"], a["initiator"], b["initiator"],
+        cp.anthropic_flags({"messages": per_turn("medium")}),
+        cp.anthropic_flags({"messages": USER + per_turn("x")[-1:]})),
+       ("agent", "agent", "agent", (True, False), (False, False)))
+
+
+@group
+def default_mode_55(ck: Check, base: str) -> None:
+    """The default mode end to end: a Copilot account that serves the three Claude 5.5 models. Their capabilities
+    here are the ones Copilot listed for the 4.x models on 2026-11-26 (no account with 5.5 was available)."""
+    def model(mid: str, out: int, **supports: Any) -> dict[str, Any]:
+        return {"id": mid, "supported_endpoints": ["/v1/messages", "/chat/completions"], "capabilities": {
+            "type": "chat", "limits": {"max_output_tokens": out, "max_prompt_tokens": 128000},
+            "supports": {"max_thinking_budget": 32000, "min_thinking_budget": 1024, **supports}}}
+
+    STATE["models"] = [
+        model("claude-sonnet-5.5", 64000, adaptive_thinking=True, reasoning_effort=["low", "medium", "high", "max"]),
+        model("claude-opus-5.5", 64000, adaptive_thinking=True,
+              reasoning_effort=["low", "medium", "high", "xhigh", "max"]),
+        model("claude-haiku-5.5", 32000)]
+    try:
+        p = start_proxy(base, any_model=False)
+    finally:
+        STATE["models"] = MODELS
+    s, _, b = call(p, "GET", "/v1/models")
+    listed = json.loads(b)["data"]
+    ck("D1 only the three 5.5 models are listed, with Copilot's own entries; none is missing",
+       (s, [m["id"] for m in listed], all("capabilities" in m for m in listed), p.catalog.missing()),
+       (200, ["claude-sonnet-5.5", "claude-opus-5.5", "claude-haiku-5.5"], True, []))
+    asked = ["claude-fable-5-2", "claude-sonnet-4-6", "claude-opus-4-8", "claude-haiku-4-5-20251001", "gpt-4.1"]
+    sent = []
+    for name in asked:
+        status = call(p, "POST", "/v1/messages", msg(name))[0]
+        sent.append((status, STATE["seen"][-1][0], STATE["seen"][-1][1]["model"]))
+    ck("D2 every name goes to the 5.5 model of its family, on the native route", sent, [
+        (200, "/v1/messages", m) for m in ("claude-sonnet-5.5", "claude-sonnet-5.5", "claude-opus-5.5",
+                                           "claude-haiku-5.5", "claude-sonnet-5.5")])
+    # what Claude Code 2.1.332 sends when it believes the model is claude-fable-5-2
+    per_turn = {"role": "system", "content": [], "output_config": {"effort": "medium"}}
+    code = {"max_tokens": 128000, "thinking": {"type": "adaptive", "display": "omitted"},
+            "output_config": {"effort": "medium"}, "messages": tool_history(1) + [per_turn]}
+    betas = {"anthropic-beta": "claude-code-20250219,per-turn-control-2026-07-01,effort-2025-11-24"}
+    got = {}
+    for name in ("claude-sonnet-4-6", "claude-opus-4-8", "claude-haiku-4-5"):
+        status = call(p, "POST", "/v1/messages", msg(name, **code), headers=betas)[0]
+        _, body, hdr = STATE["seen"][-1]
+        sent_betas = {k.lower(): v for k, v in hdr.items()}.get("anthropic-beta", "")
+        got[body["model"]] = (status, body["max_tokens"], body["thinking"], body.get("output_config"),
+                              len(body["messages"]), "per-turn-control-2026-07-01" in sent_betas,
+                              hdr.get("X-Initiator"))
+    kept = (200, 64000, code["thinking"], {"effort": "medium"}, 4, True, "agent")
+    ck("D3 Claude Code's settings: kept on Sonnet and Opus 5.5; fitted on Haiku 5.5; tool follow-up stays agent", got, {
+        "claude-sonnet-5.5": kept, "claude-opus-5.5": kept,
+        "claude-haiku-5.5": (200, 32000, {"type": "enabled", "display": "omitted", "budget_tokens": 30976}, None, 3,
+                             False, "agent")})
+    efforts = {}
+    for name in ("claude-sonnet-4-6", "claude-opus-4-8"):
+        call(p, "POST", "/v1/messages", msg(name, output_config={"effort": "xhigh"}))
+        efforts[STATE["seen"][-1][1]["model"]] = STATE["seen"][-1][1]["output_config"]["effort"]
+    ck("D4 effort xhigh: lowered to high on Sonnet 5.5, kept on Opus 5.5", efforts,
+       {"claude-sonnet-5.5": "high", "claude-opus-5.5": "xhigh"})
+    s, _, b = call(p, "POST", "/v1/messages", msg("claude-sonnet-4-6", stream=True))
+    counts = [json.loads(call(p, "POST", "/v1/messages/count_tokens", {"model": n, "messages": USER})[2])
+              for n in ("sonnet", "opus", "haiku")]
+    ck("D5 stream forwarded unchanged; exact token count for all three",
+       (s, b, counts, STATE["seen"][-1][0]), (200, "".join(NATIVE_SSE), [{"input_tokens": 42}] * 3,
+                                               "/v1/messages/count_tokens"))
+    refused = call(p, "POST", "/v1/chat/completions", {"model": "gpt-4.1", "messages": USER})[0]
+    passed = call(p, "POST", "/v1/chat/completions", {"model": "claude-haiku-5.5", "messages": USER})[0]
+    ck("D6 OpenAI route: another model is refused, a 5.5 model passes",
+       (refused, passed, STATE["seen"][-1][0], STATE["seen"][-1][1]["model"]),
+       (400, 200, "/chat/completions", "claude-haiku-5.5"))
+    env = cp.claude_code_env("http://127.0.0.1:4141", p.catalog, None, None)
+    ck("D7 printed Claude Code settings name the three 5.5 models", (
+        env["ANTHROPIC_MODEL"], env["ANTHROPIC_DEFAULT_OPUS_MODEL"], env["ANTHROPIC_DEFAULT_HAIKU_MODEL"],
+        env["CLAUDE_CODE_SUBAGENT_MODEL"], env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"]),
+       ("claude-sonnet-5.5", "claude-opus-5.5", "claude-haiku-5.5", "claude-haiku-5.5", "128000"))
+    # an account without the 5.5 models (the usual fake list has no claude-haiku-5.5): Copilot refuses the model
+    without = start_proxy(base, any_model=False)
+    STATE["script"] = ["unsupported"]
+    s, _, b = call(without, "POST", "/v1/messages", msg("claude-haiku-4-5"))
+    text = json.loads(b)["error"]["message"] if s == 400 else b
+    ck("D8 account without 5.5: Copilot's refusal comes back readable, with the way out", (
+        s, text.startswith("The requested model is not supported. (model_not_supported)"), "--any-model" in text,
+        "it lists claude-sonnet-5.5" in text, "\\" in text), (400, True, True, True, False))
 
 
 @group

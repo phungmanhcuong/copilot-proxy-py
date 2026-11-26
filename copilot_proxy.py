@@ -210,6 +210,14 @@ def http_json_request(
     return status, body
 
 
+def upstream_error(raw: bytes) -> tuple[str, str]:
+    """(message, code) of a Copilot error body; the whole text when it is not the usual {"error": {...}}."""
+    err = _json_object(raw).get("error")
+    if isinstance(err, dict) and isinstance(err.get("message"), str):
+        return err["message"], str(err.get("code") or "")
+    return raw.decode("utf-8", errors="replace").strip(), ""
+
+
 def _retry_after(header: Optional[str], attempt: int) -> Optional[float]:
     """Seconds to wait before a retry, or None when the server asks for longer than MAX_RETRY_WAIT."""
     if header:
@@ -1266,7 +1274,8 @@ def anthropic_flags(payload: dict[str, Any]) -> tuple[bool, bool]:
     continuing its own tool loop. A prompt the person typed (even deep in a conversation) stays "user", so
     Copilot bills it as the prompt it is."""
     msgs = _dicts(payload.get("messages"))
-    # the last turn of the conversation decides; a per-turn control message after it (role "system") does not
+    # the last turn of the conversation decides, wherever a per-turn control message (role "system") sits.
+    # Measured: Claude Code 2.1.332 sends user, system(per-turn), assistant, user(tool_result)
     turns = [m for m in msgs if m.get("role") in ("user", "assistant")]
     agent = bool(turns) and is_tool_continuation(turns[-1])
 
@@ -1314,7 +1323,7 @@ def fit_to_model(body: dict[str, Any], supports: dict[str, Any]) -> bool:
     the settings of the model it was told it has, and the proxy may have mapped that to another one:
     - adaptive thinking becomes a fixed thinking budget on a model without adaptive thinking;
     - output_config.effort becomes a level the model has, or is removed on a model without reasoning effort.
-      The same for the per-turn setting, which Claude Code sends as a last message
+      The same for the per-turn setting, which Claude Code sends as a message after the prompt:
       {"role": "system", "content": [], "output_config": {...}}.
     Without this Copilot answers 400 (measured: Claude Code 2.1.332, claude-haiku-4.5). Returns True when a
     per-turn message was removed; the caller then drops the per-turn beta too. Nothing is changed when the
@@ -2017,10 +2026,18 @@ class Handler(BaseHTTPRequestHandler):
         log = dict(route="translate", model=model, stream=stream, initiator="agent" if agent else "user")
         up = self._copilot("/chat/completions", oai, agent, vision)
         if up.status != 200:
-            err = up.body().decode("utf-8", errors="replace")
-            LOG.warning("Copilot error %d: %s", up.status, err[:500])
+            LOG.warning("Copilot error %d: %s", up.status, up.body()[:500])
             self._record(log, started, up.status)
-            raise Reject(up.status, err, self._passthrough_headers(up))
+            message, code = upstream_error(up.body())
+            cat = self.server.catalog
+            if code:
+                message += f" ({code})"
+            if code == "model_not_supported" and cat.only:
+                listed = [m for m in cat.chat_model_ids() if m.startswith("claude")]
+                message += (f" This Copilot account does not serve {model}"
+                            + (f"; it lists {', '.join(listed)}" if listed else "")
+                            + ". Start the proxy with --any-model to use the models the account has.")
+            raise Reject(up.status, message, self._passthrough_headers(up))
         if not stream:
             try:
                 out = openai_to_anthropic_response(json.loads(up.body()), requested or model)
@@ -2346,8 +2363,8 @@ def print_banner(args: argparse.Namespace, tm: TokenManager, catalog: ModelCatal
         print(f"Models: only {', '.join(catalog.only.values())} (every request maps to one of these by family; "
               "--any-model for the full catalog)")
         if catalog.missing():
-            LOG.warning("This Copilot account does not list %s yet: requests for it will fail upstream",
-                        ", ".join(catalog.missing()))
+            LOG.warning("This Copilot account does not list %s: requests for it will fail (model_not_supported). "
+                        "--any-model uses the models the account has.", ", ".join(catalog.missing()))
     else:
         print(f"Chat models ({len(ids)}): {', '.join(ids)}")
     if args.claude_code:

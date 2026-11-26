@@ -252,6 +252,8 @@ Every failure gets an answer; the proxy doesn't close the connection without one
 - A request the proxy can't read gets a 400: invalid JSON, `messages` that isn't a list of objects, a `max_tokens`
   that isn't a positive integer. A body over 64 MB gets a 413.
 - A Copilot error is passed on with its status, body and `retry-after`.
+- If the account doesn't serve one of the three 5.5 models, Copilot answers `model_not_supported`. The proxy passes
+  that on with the Claude models the account does list and the way out (`--any-model`).
 - If GitHub or Copilot can't be reached, the answer is a 502. In the default mode `/v1/models` still lists the
   three models; with `--any-model` it answers 502 until the model list can be loaded.
 - After a stream has started, a failure is sent as an `event: error`. On the translated route this includes an
@@ -264,11 +266,11 @@ Every failure gets an answer; the proxy doesn't close the connection without one
   native route keeps both.
 - Follow-up turns in a tool loop are sent with `X-Initiator: agent`, as copilot-api does. Fresh prompts, including
   a subagent's first prompt, are sent as `user`: the proxy never relabels a new prompt to avoid billing.
-  The last user or assistant message decides. A per-turn control message that Claude Code adds after a tool result
-  (`{"role": "system", "content": [], "output_config": {...}}`) doesn't turn the follow-up into a new prompt.
+  The last user or assistant message decides. A control message such as Claude Code's per-turn setting
+  (`{"role": "system", "content": [], "output_config": {...}}`, sent right after the prompt) never changes it.
 
 ## Tests
-`python3 test_offline.py` runs 90 checks against a fake Copilot upstream on 127.0.0.1. It needs no network, login or
+`python3 test_offline.py` runs 98 checks against a fake Copilot upstream on 127.0.0.1. It needs no network, login or
 Copilot quota, and passes on Python 3.9 to 3.12. `python3 test_offline.py stream pool` runs only the groups whose
 name contains one of the words.
 
@@ -281,6 +283,7 @@ name contains one of the words.
 | Copilot errors, retries, fallback, unreachable upstream | 14 |
 | Context editing over the wire, fit to the model, rate limit, manual approval | 13 |
 | Connection reuse, IPv6 and Unix-socket listeners | 7 |
+| Default mode end to end: an account that serves the three Claude 5.5 models, and one that doesn't | 8 |
 
 ## License
 MIT. See `LICENSE`.
