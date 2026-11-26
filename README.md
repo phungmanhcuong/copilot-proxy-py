@@ -288,7 +288,7 @@ Every failure gets an answer; the proxy doesn't close the connection without one
   (`{"role": "system", "content": [], "output_config": {...}}`, sent right after the prompt) never changes it.
 
 ## Tests
-`python3 test_offline.py` runs 108 checks against a fake Copilot upstream on 127.0.0.1. It needs no network, login or
+`python3 test_offline.py` runs 109 checks against a fake Copilot upstream on 127.0.0.1. It needs no network, login or
 Copilot quota, and passes on Python 3.9 to 3.12. `python3 test_offline.py stream pool` runs only the groups whose
 name contains one of the words.
 
@@ -302,7 +302,7 @@ name contains one of the words.
 | Context editing over the wire, fit to the model, rate limit, manual approval | 13 |
 | Connection reuse, IPv6 and Unix-socket listeners | 7 |
 | Default mode end to end: an account that serves the three Claude 5.5 models, and one that doesn't | 8 |
-| Security hardening: log and prompt text, client timeout, body limits, cross-site GET, `/token`, framing, API address | 10 |
+| Security hardening: log and prompt text, client timeout, body limits, cross-site GET, `/token`, framing, API address | 11 |
 
 ## License
 MIT. See `LICENSE`.

@@ -1007,6 +1007,19 @@ def hardening(ck: Check, base: str) -> None:
             os.umask(old_mask)
         ck("H9 a new usage log is readable by its owner only",
            stat.S_IMODE(os.stat(os.path.join(tmp, "usage.jsonl")).st_mode), 0o600)
+    import struct
+    saved_err, sys.stderr = sys.stderr, io.StringIO()
+    try:
+        for _ in range(5):  # connect and reset at once: the proxy is still waiting for the request line
+            s = socket.create_connection(("127.0.0.1", port))
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+            s.close()
+        time.sleep(0.5)
+        noise = sys.stderr.getvalue()
+    finally:
+        sys.stderr = saved_err
+    ck("H11 a client that resets its connection leaves no traceback on the terminal",
+       ("Traceback" in noise, call(p, "GET", "/health")[0]), (False, 200))
     ck("H10 only loopback addresses may be served without a client key",
        [getattr(cp, "is_loopback", lambda h: None)(h) for h in (
            "127.0.0.1", "localhost", "::1", "127.9.9.9", "0.0.0.0", "::", "192.168.1.5", "example.com")],

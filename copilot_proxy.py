@@ -1583,6 +1583,15 @@ class _ProxyConfig:
         self.no_context_edit: set[str] = set()  # models that refused context_management
         self.is_unix = False
 
+    def handle_error(self, request: Any, client_address: Any) -> None:
+        """A client that goes away or stays silent before its request is read is routine: one debug line, not
+        a traceback on the terminal (which any client could cause at will)."""
+        exc = sys.exc_info()[1]
+        if isinstance(exc, (ConnectionError, socket.timeout)):
+            LOG.debug("client connection ended: %s", exc)
+        else:
+            LOG.exception("request from %s failed", client_address)
+
     def use_native(self, model: str) -> bool:
         """Whether a /v1/messages request for this model goes to Copilot's own /v1/messages."""
         return self.mode == "native" or (self.mode == "auto" and self.catalog.supports_endpoint(model, "/v1/messages"))
