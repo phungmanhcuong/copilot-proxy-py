@@ -230,10 +230,27 @@ the environment also reaches the commands Claude Code runs; `CLAUDE_CODE_SUBPROC
 - The proxy binds to `127.0.0.1` by default.
 - Requests whose `Host` isn't `127.0.0.1`, `localhost` or `[::1]` get 403. This blocks DNS rebinding. Add names
   with `--allow-host`.
-- Browser requests that carry an `Origin` get 403, and no CORS headers are sent. This stops any web page from using
-  your account. Allow an origin with `--cors-origin`.
-- If you bind to `0.0.0.0`, anyone who can reach the port uses your Copilot account.
+- Browser requests that carry an `Origin`, or that the browser marks as coming from another site
+  (`Sec-Fetch-Site`), get 403, and no CORS headers are sent. This stops any web page from using your account.
+  Allow an origin with `--cors-origin`.
+- On TCP without `--auth-token`, every local process can use the proxy. Use `--unix-socket` or
+  `--auth-token auto` if other programs on the machine shouldn't.
+- A host other than a loopback address needs a client key: without `--auth-token` the proxy refuses to start.
+  Anyone who can reach the port and knows the key uses your Copilot account.
+- `GET /token` needs `--show-token` and a client key (or the Unix socket).
+- A client that stays silent for 120 s while the proxy waits for its request is disconnected
+  (`COPILOT_PROXY_CLIENT_TIMEOUT`).
+- Control characters sent by a client are shown as text in the log and in the `--manual` prompt.
+- The Copilot API address in GitHub's token answer is used only when it is `https` on `*.githubcopilot.com` or
+  `*.ghe.com`.
+- `-g TOKEN` and `--auth-token KEY` on the command line are visible in `ps`. Prefer the saved login and
+  `COPILOT_PROXY_AUTH_TOKEN`.
 - `-H ::1` listens on IPv6.
+- If a copy from before commit `6f22f41` (24 Nov 2026) is still running, stop it. That first version answered
+  every website with `Access-Control-Allow-Origin: *`.
+
+A scan of 26 Nov 2026 (static analysis, the git history, 28 live probes) found no high-severity issue in the
+code; its low findings are fixed and each has a check in `test_offline.py` (group `hardening`).
 
 ## Endpoints
 - `POST /v1/messages`: Anthropic Messages, with or without streaming
@@ -245,12 +262,13 @@ the environment also reaches the commands Claude Code runs; `CLAUDE_CODE_SUBPROC
 - `GET /v1/models`
 - `GET /usage`
 - `GET /health`
-- `GET /token`: disabled unless you pass `--show-token`
+- `GET /token`: disabled unless you pass `--show-token` and a client key
 
 ## Errors
 Every failure gets an answer; the proxy doesn't close the connection without one.
 - A request the proxy can't read gets a 400: invalid JSON, `messages` that isn't a list of objects, a `max_tokens`
-  that isn't a positive integer. A body over 64 MB gets a 413.
+  that isn't a positive integer, `Content-Length` together with `Transfer-Encoding`. A body over 64 MB, or with
+  more than 2,000,000 JSON items, gets a 413. A body that stops arriving gets a 408.
 - A Copilot error is passed on with its status, body and `retry-after`.
 - If the account doesn't serve one of the three 5.5 models, Copilot answers `model_not_supported`. The proxy passes
   that on with the Claude models the account does list and the way out (`--any-model`).
@@ -270,7 +288,7 @@ Every failure gets an answer; the proxy doesn't close the connection without one
   (`{"role": "system", "content": [], "output_config": {...}}`, sent right after the prompt) never changes it.
 
 ## Tests
-`python3 test_offline.py` runs 98 checks against a fake Copilot upstream on 127.0.0.1. It needs no network, login or
+`python3 test_offline.py` runs 108 checks against a fake Copilot upstream on 127.0.0.1. It needs no network, login or
 Copilot quota, and passes on Python 3.9 to 3.12. `python3 test_offline.py stream pool` runs only the groups whose
 name contains one of the words.
 
@@ -284,6 +302,7 @@ name contains one of the words.
 | Context editing over the wire, fit to the model, rate limit, manual approval | 13 |
 | Connection reuse, IPv6 and Unix-socket listeners | 7 |
 | Default mode end to end: an account that serves the three Claude 5.5 models, and one that doesn't | 8 |
+| Security hardening: log and prompt text, client timeout, body limits, cross-site GET, `/token`, framing, API address | 10 |
 
 ## License
 MIT. See `LICENSE`.

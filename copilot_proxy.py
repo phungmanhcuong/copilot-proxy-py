@@ -29,6 +29,7 @@ import argparse
 import base64
 import hmac
 import http.client
+import ipaddress
 import json
 import logging
 import math
@@ -111,6 +112,14 @@ MAX_RETRY_WAIT = 20.0  # longer Retry-After values go back to the client instead
 CONNECT_TIMEOUT = 15   # seconds to reach GitHub or Copilot (TCP + TLS), and for each short GitHub API call
 REQUEST_TIMEOUT = 600  # longest silence accepted from Copilot while it answers
 MAX_BODY = 64 * 1024 * 1024  # largest accepted request body (Claude Code sends images base64-encoded)
+# Most commas, brackets and braces accepted in a request body. Every JSON item costs memory of its own (measured:
+# a 16 MB body of empty lists took 424 MB), and a real request stays far below this: text is bounded by the
+# model's context, and an image is one string.
+MAX_JSON_ITEMS = 2_000_000
+# Seconds a client may stay silent while the proxy waits for its request or for it to take the answer. Without
+# a limit, connections that never finish their request each hold a thread for ever.
+CLIENT_TIMEOUT = _env_int("COPILOT_PROXY_CLIENT_TIMEOUT", 120, 1, 3600)
+API_HOST_SUFFIXES = (".githubcopilot.com", ".ghe.com")  # where the Copilot API may live (GitHub.com, GHE.com)
 # Idle connections to Copilot kept for the next request. Measured 2026-11: a new TLS connection to
 # api.individual.githubcopilot.com took 524 ms (median of 5); Copilot kept an idle connection open for 90 s and
 # had closed it by 120 s.
@@ -129,6 +138,34 @@ CLEAR_KEEP = _env_int("COPILOT_PROXY_CLEAR_KEEP", 3, 0, 1000)
 CLEAR_STEP = _env_int("COPILOT_PROXY_CLEAR_STEP", 10, 1, 1000)
 
 LOG = logging.getLogger("copilot-proxy")
+
+_UNSAFE = {c: "\\x%02x" % c for c in (*range(0x20), *range(0x7f, 0xa0))}
+_UNSAFE.update({c: "\\u%04x" % c for c in (0x2028, 0x2029, *range(0x202a, 0x202f), *range(0x2066, 0x206a))})
+
+
+def printable(value: Any) -> str:
+    """Text that is safe to show on the operator's terminal. Control characters, line breaks and text-direction
+    marks are written as escapes, so that a model name or URL sent by a client cannot drive the terminal, forge
+    a log line or change what the --manual prompt appears to ask."""
+    return str(value).translate(_UNSAFE)
+
+
+class _PrintableLog(logging.Filter):
+    """Every log line passes through printable(); a traceback keeps its own line breaks."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            message = record.getMessage()
+        except Exception:
+            message = str(record.msg)
+        record.msg, record.args = printable(message), ()
+        if record.exc_info and not record.exc_text:
+            trace = logging.Formatter().formatException(record.exc_info)
+            record.exc_text = "\n".join(printable(line) for line in trace.split("\n"))
+        return True
+
+
+LOG.addFilter(_PrintableLog())
 
 
 def default_token_path() -> Path:
@@ -581,6 +618,19 @@ def run_device_auth_flow(token_path: Path, show_token: bool = False) -> str:
     raise UpstreamError("GitHub device authorization timed out.")
 
 
+def trusted_api_url(url: Any) -> Optional[str]:
+    """The Copilot API address from GitHub's token answer when it is https on a GitHub Copilot host, else None."""
+    try:
+        parts = urllib.parse.urlsplit(str(url))
+        host = (parts.hostname or "").lower()
+    except ValueError:
+        return None
+    if parts.scheme == "https" and not parts.username and (
+            host == "githubcopilot.com" or host.endswith(API_HOST_SUFFIXES)):
+        return str(url).rstrip("/")
+    return None
+
+
 class TokenManager:
     """Caches the short-lived Copilot token and refreshes it in the background."""
 
@@ -615,9 +665,11 @@ class TokenManager:
             self._expires_at = float(exp)
         else:
             self._expires_at = time.time() + int(data.get("refresh_in", 1500))
-        endpoints = data.get("endpoints")
-        if isinstance(endpoints, dict) and endpoints.get("api"):
-            self._base_url = str(endpoints["api"]).rstrip("/")
+        api = _dict_get(data, "endpoints").get("api")
+        if api and trusted_api_url(api):
+            self._base_url = trusted_api_url(api) or self._base_url
+        elif api:  # the Copilot token and every prompt go to this address: never to an unexpected one
+            LOG.warning("Ignoring the API address in GitHub's answer (%s): not https on a GitHub Copilot host", api)
         LOG.info("Copilot token refreshed (base=%s, expires_in=%ds)",
                  self._base_url, int(self._expires_at - time.time()))
         if self.show_token:
@@ -701,7 +753,7 @@ class RequestGuard:
         if self.manual_approval:
             with _APPROVAL_LOCK:  # one prompt at a time; Claude Code sends requests in parallel
                 try:
-                    ans = input(f"\n[APPROVAL] Forward {summary}? [y/N]: ")
+                    ans = input(f"\n[APPROVAL] Forward {printable(summary)}? [y/N]: ")
                 except EOFError:
                     ans = "n"
             if ans.strip().lower() not in ("y", "yes"):
@@ -1457,7 +1509,8 @@ class UsageLog:
             if self.path:
                 try:
                     self.path.parent.mkdir(parents=True, exist_ok=True)
-                    with self.path.open("a", encoding="utf-8") as fh:
+                    fd = os.open(self.path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)  # a new file: owner only
+                    with os.fdopen(fd, "a", encoding="utf-8") as fh:
                         fh.write(json.dumps(row, ensure_ascii=False) + "\n")
                 except (OSError, UnicodeEncodeError) as exc:
                     LOG.warning("usage log write failed: %s", exc)
@@ -1605,6 +1658,7 @@ class UnixProxyServer(_ProxyConfig, socketserver.ThreadingMixIn, _UnixBase):  # 
 
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
+    timeout = CLIENT_TIMEOUT  # for each read from and write to the client, not for the wait on Copilot
     server: Any  # ProxyServer | UnixProxyServer
     _streaming = False  # the SSE answer has started: a failure can only be sent as an event
     _answered = False   # the whole answer is out: nothing more may be written for this request
@@ -1622,6 +1676,12 @@ class Handler(BaseHTTPRequestHandler):
 
     def log_message(self, fmt: str, *args: Any) -> None:
         LOG.info("%s %s", self.address_string(), fmt % args)
+
+    def log_error(self, fmt: str, *args: Any) -> None:
+        if fmt.startswith("Request timed out"):  # an idle kept-alive connection reached CLIENT_TIMEOUT: routine
+            LOG.debug("%s closed after %ds without a request", self.address_string(), CLIENT_TIMEOUT)
+        else:
+            self.log_message(fmt, *args)
 
     # -- one request -------------------------------------------------------
 
@@ -1673,11 +1733,15 @@ class Handler(BaseHTTPRequestHandler):
         srv = self.server
         host = self.headers.get("Host") or ""
         origin = self.headers.get("Origin")
+        # browsers add Sec-Fetch-Site to every request; an image or script tag sends a GET without an Origin
+        from_other_site = (self.headers.get("Sec-Fetch-Site") or "").lower() in ("cross-site", "same-site")
         status, reason = 403, None
         if srv.check_host and host_name(host) not in srv.allowed_hosts:
             reason = f"Host '{host}' not allowed (use --allow-host)"
         elif origin and not ("*" in srv.cors_origins or origin in srv.cors_origins):
             reason = f"Origin '{origin}' not allowed (use --cors-origin)"
+        elif from_other_site and not origin and "*" not in srv.cors_origins:
+            reason = "Browser request from another site not allowed (use --cors-origin)"
         elif srv.auth_token and self._path() not in ("/", "/health") and self.command != "OPTIONS" \
                 and not self._key_ok():
             status, reason = 401, "Missing or wrong proxy key (Authorization: Bearer <key> or x-api-key)"
@@ -1778,16 +1842,24 @@ class Handler(BaseHTTPRequestHandler):
     # -- request -----------------------------------------------------------
 
     def _read_body(self) -> bytes:
-        """The request body (Content-Length or chunked), at most MAX_BODY bytes. A body that cannot be framed
-        also ends the connection, because the next request could not be found in it."""
+        """The request body (Content-Length or chunked), at most MAX_BODY bytes. A body that cannot be framed,
+        or that stops arriving, also ends the connection: the next request could not be found in it."""
+        try:
+            return self._read_framed()
+        except socket.timeout:
+            raise Reject(408, f"No request data for {CLIENT_TIMEOUT} s", close=True) from None
+
+    def _read_framed(self) -> bytes:
         def bad(status: int, message: str) -> Reject:
             return Reject(status, message, close=True)
 
         codings = [t.strip().lower() for h in (self.headers.get_all("Transfer-Encoding") or []) for t in h.split(",")]
+        lengths = {v.strip() for v in (self.headers.get_all("Content-Length") or [])}
         if codings and codings[-1] != "chunked":
             raise bad(400, "Unsupported Transfer-Encoding")
+        if codings and lengths:  # two ways to find the end of the body: a server in front could pick the other
+            raise bad(400, "Content-Length and Transfer-Encoding together")
         if not codings:
-            lengths = {v.strip() for v in (self.headers.get_all("Content-Length") or [])}
             if not lengths:
                 return b""
             value = lengths.pop()
@@ -1803,7 +1875,7 @@ class Handler(BaseHTTPRequestHandler):
         while True:
             line = self.rfile.readline(1024)
             field = line.split(b";")[0].strip()  # the chunk size in hex; chunk extensions are ignored
-            if not line.endswith(b"\n") or not field or not all(c in b"0123456789abcdefABCDEF" for c in field):
+            if not line.endswith(b"\r\n") or not field or not all(c in b"0123456789abcdefABCDEF" for c in field):
                 raise bad(400, "Malformed chunked body")
             size = int(field, 16)
             if size == 0:
@@ -1812,11 +1884,11 @@ class Handler(BaseHTTPRequestHandler):
             if total > MAX_BODY:
                 raise bad(413, f"Request body over {MAX_BODY} bytes")
             data = self.rfile.read(size)
-            if len(data) != size or self.rfile.readline(8) not in (b"\r\n", b"\n"):
+            if len(data) != size or self.rfile.readline(8) != b"\r\n":
                 raise bad(400, "Truncated chunked body")
             parts.append(data)
         for _ in range(64):  # trailers, bounded
-            if self.rfile.readline(1024) in (b"\r\n", b"\n", b""):
+            if self.rfile.readline(1024) in (b"\r\n", b""):
                 break
         else:
             self.close_connection = True  # unread trailers: do not reuse the connection
@@ -1824,6 +1896,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def _read_json(self) -> dict[str, Any]:
         raw = self._read_body()
+        if raw.count(b",") + raw.count(b"[") + raw.count(b"{") > MAX_JSON_ITEMS:
+            raise Reject(413, f"Request body has more than {MAX_JSON_ITEMS} JSON items")
         try:
             body = json.loads(raw) if raw else {}
         except (ValueError, RecursionError) as exc:
@@ -1899,9 +1973,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def _get(self) -> None:
         srv, path = self.server, self._path()
-        if path in ("/", "/health"):
+        if path in ("/", "/health"):  # the one route that needs no client key: it says nothing about the account
             self._send_json(200, {"status": "ok", "service": "copilot-proxy-stdlib",
-                                  "api_base_url": srv.tm.api_base_url})
+                                  **({} if srv.auth_token else {"api_base_url": srv.tm.api_base_url})})
         elif path in ("/models", "/v1/models"):
             self._send_json(200, srv.catalog.get_models_payload())
         elif path == "/usage":
@@ -1912,6 +1986,8 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/token":
             if not srv.show_token:
                 raise Reject(403, "Disabled. Start with --show-token to enable.")
+            if not (srv.auth_token or srv.is_unix):  # on TCP without a key any local process could take the token
+                raise Reject(403, "GET /token needs a client key: start with --auth-token (or --unix-socket).")
             token, base = srv.tm.get_token()
             self._send_json(200, {"token": token, "api_base_url": base})
         else:
@@ -2307,11 +2383,22 @@ def reexec_sandboxed(args: argparse.Namespace) -> None:
         private_dir(Path(args.unix_socket).expanduser().absolute().parent)
     if getattr(args, "usage_log", None):
         Path(args.usage_log).expanduser().absolute().parent.mkdir(parents=True, exist_ok=True)
-    LOG.debug("sandbox profile:\n%s", profile)
+    for line in profile.splitlines():
+        LOG.debug("sandbox profile: %s", line)
     argv = [a for a in sys.argv[1:] if a != "--sandbox-self"] + ["--sandbox-self"]  # child re-checks (above)
     os.environ["COPILOT_PROXY_SANDBOXED"] = "1"
     os.execv("/usr/bin/sandbox-exec", ["sandbox-exec", "-p", profile, os.path.realpath(sys.executable), "-I",
                                         os.path.realpath(os.path.abspath(sys.argv[0])), *argv])
+
+
+def is_loopback(host: str) -> bool:
+    """Whether a --host value can only be reached from this machine."""
+    if host.lower() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host.strip("[]")).is_loopback
+    except ValueError:
+        return False
 
 
 def cmd_auth(args: argparse.Namespace) -> None:
@@ -2411,6 +2498,9 @@ def cmd_start(args: argparse.Namespace) -> None:
         sock: Optional[str] = str(server.socket_path)
         base = "http://localhost"
     else:
+        if not auth and not is_loopback(args.host):
+            raise SystemExit(f"copilot_proxy: refusing to listen on {args.host} without a client key: everyone who "
+                             "can reach the port could use your Copilot account. Add --auth-token auto.")
         try:
             server = ProxyServer((args.host, args.port), tm, catalog, guard, args.show_token, **kw)
         except OSError as exc:
@@ -2423,7 +2513,7 @@ def cmd_start(args: argparse.Namespace) -> None:
     server.auth_token = auth
     server.context_edit = args.context_edit
     if not server.check_host and not sock:
-        LOG.warning("Bound to %s: any Host is accepted and anyone who can reach this port uses your Copilot account",
+        LOG.warning("Bound to %s: any Host is accepted; the client key is all that protects your Copilot account",
                     args.host)
     print_banner(args, tm, catalog, base, sock, auth)
 

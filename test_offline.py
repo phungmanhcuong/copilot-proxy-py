@@ -900,6 +900,120 @@ def default_mode_55(ck: Check, base: str) -> None:
 
 
 @group
+def hardening(ck: Check, base: str) -> None:
+    """The findings of the security scan of 2026-11-26, one check each."""
+    import io
+    p = start_proxy(base)
+    port = p.server_address[1]
+    head = b"POST /v1/messages HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n"
+    body = json.dumps(msg()).encode()
+
+    # control characters from a client never reach the terminal
+    buf = io.StringIO()
+    handler = cp.logging.StreamHandler(buf)
+    cp.LOG.addHandler(handler)
+    cp.logging.disable(cp.logging.NOTSET)
+    level, cp.LOG.level = cp.LOG.level, cp.logging.DEBUG
+    try:
+        raw_call(p, b"GET /\x1b[2Jcleared HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+        call(p, "POST", "/v1/messages", msg("x\u001b[2J\n12:00:00 [INFO] forged line"))
+        text = buf.getvalue()
+    finally:
+        cp.logging.disable(cp.logging.CRITICAL)
+        cp.LOG.removeHandler(handler)
+        cp.LOG.level = level
+    ck("H1 log: escape sequences and line breaks sent by a client are written as text",
+       ("\x1b" in text, "\n12:00:00 [INFO] forged line" in text, "\\x1b[2J" in text, text.count("\n") > 2),
+       (False, False, True, True))
+    prompts: list[str] = []
+    saved_input, builtins.input = builtins.input, lambda prompt="": (prompts.append(prompt), "n")[1]
+    try:
+        manual = start_proxy(DEAD, load=False)  # no model list: the client's model name is used as it came
+        manual.guard.manual_approval = True
+        status = call(manual, "POST", "/v1/messages", msg("claude-haiku-4.5\rFAKE: forward a harmless request"))[0]
+    finally:
+        builtins.input = saved_input
+    ck("H2 --manual: the approval prompt shows a client's control characters as text",
+       (status, len(prompts), "\r" in prompts[0], "\\x0dFAKE" in prompts[0]), (403, 1, False, True))
+
+    # a client that stops sending is dropped; a normal request still works
+    saved_timeout, cp.Handler.timeout = cp.Handler.timeout, 1
+    try:
+        started = time.time()
+        with socket.create_connection(("127.0.0.1", port), timeout=6) as s1, \
+                socket.create_connection(("127.0.0.1", port), timeout=6) as s2:
+            s1.sendall(b"GET /health HTT")
+            s2.sendall(head + b"Content-Length: 1000\r\n\r\n{")
+            closed = (s1.recv(100), s2.recv(4096).split(b"\r\n")[0])
+        waited = time.time() - started
+        ck("H3 a connection that never finishes its request, or its body, is closed after the client timeout",
+           (closed, waited < 5, call(p, "POST", "/v1/messages", msg())[0]),
+           ((b"", b"HTTP/1.1 408 Request Timeout"), True, 200))
+    finally:
+        cp.Handler.timeout = saved_timeout
+
+    saved_items, cp.MAX_JSON_ITEMS = getattr(cp, "MAX_JSON_ITEMS", None), 1000
+    try:
+        flood = msg(messages=[{"role": "user", "content": [[] for _ in range(2000)]}])
+        ck("H4 a body with more JSON items than the limit is refused before it is parsed; a normal one passes",
+           (call(p, "POST", "/v1/messages", flood)[0], call(p, "POST", "/v1/messages", msg())[0]), (413, 200))
+    finally:
+        cp.MAX_JSON_ITEMS = saved_items
+
+    def site(value: Optional[str], proxy: Any = p, origin: Optional[str] = None) -> int:
+        headers = {**({"Sec-Fetch-Site": value} if value else {}), **({"Origin": origin} if origin else {})}
+        return call(proxy, "GET", "/stats", headers=headers)[0]
+
+    cors = start_proxy(base)
+    cors.cors_origins = {"https://app.example"}
+    ck("H5 a browser GET from another site is refused even without an Origin header",
+       (site("cross-site"), site("same-site"), site("none"), site("same-origin"), site(None),
+        site("cross-site", cors, "https://app.example")), (403, 403, 200, 200, 200, 200))
+
+    shown = serve(cp.ProxyServer(("127.0.0.1", 0), p.tm, p.catalog, cp.RequestGuard(None, False, False), True))
+    no_key = call(shown, "GET", "/token")[0]
+    shown.auth_token = "k"
+    with_key = call(shown, "GET", "/token", headers={"x-api-key": "k"})
+    health = json.loads(call(shown, "GET", "/health")[2])
+    ck("H6 /token needs a client key even with --show-token; /health says nothing about the account when a key is set",
+       (no_key, with_key[0], "copilot-test" in with_key[2], sorted(health),
+        "api_base_url" in json.loads(call(p, "GET", "/health")[2])),
+       (403, 200, True, ["service", "status"], True))
+
+    chunked = b"%x\r\n%s\r\n0\r\n\r\n" % (len(body), body)
+    ck("H7 request framing: Content-Length with Transfer-Encoding, and bare line feeds in a chunked body, get 400",
+       (raw_call(p, head + b"Content-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n" + chunked),
+        raw_call(p, head + b"Transfer-Encoding: chunked\r\n\r\n" + b"%x\n%s\n0\n\n" % (len(body), body)),
+        raw_call(p, head + b"Transfer-Encoding: chunked\r\n\r\n" + chunked)), (400, 400, 200))
+
+    real_request = cp.http_json_request
+    answers = iter(["http://attacker.example", "https://githubcopilot.com.evil.example",
+                    "https://api.business.githubcopilot.com/"])
+    cp.http_json_request = lambda *a, **k: (200, {"token": "t", "expires_at": time.time() + 1000,
+                                                  "endpoints": {"api": next(answers)}})
+    try:
+        tm = cp.TokenManager("gh-test")
+        bases = [tm.get_token(force_refresh=True)[1] for _ in range(3)]
+    finally:
+        cp.http_json_request = real_request
+    ck("H8 the API address from GitHub is used only when it is https on a GitHub Copilot host", bases,
+       ["https://api.githubcopilot.com", "https://api.githubcopilot.com", "https://api.business.githubcopilot.com"])
+
+    with tempfile.TemporaryDirectory() as tmp:
+        old_mask = os.umask(0o022)
+        try:
+            cp.UsageLog(os.path.join(tmp, "usage.jsonl")).record(route="native", model="m", status=200)
+        finally:
+            os.umask(old_mask)
+        ck("H9 a new usage log is readable by its owner only",
+           stat.S_IMODE(os.stat(os.path.join(tmp, "usage.jsonl")).st_mode), 0o600)
+    ck("H10 only loopback addresses may be served without a client key",
+       [getattr(cp, "is_loopback", lambda h: None)(h) for h in (
+           "127.0.0.1", "localhost", "::1", "127.9.9.9", "0.0.0.0", "::", "192.168.1.5", "example.com")],
+       [True, True, True, True, False, False, False, False])
+
+
+@group
 def limits(ck: Check, base: str) -> None:
     r = start_proxy(base, rate=30.0)
     first = call(r, "POST", "/v1/messages", msg())[0]
