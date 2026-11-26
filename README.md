@@ -8,6 +8,7 @@ OpenAI-compatible client) use your **GitHub Copilot** subscription. It's a Pytho
 - Anthropic Messages API to OpenAI Chat Completions, with or without streaming, including tools and images
 - Automatic Copilot token refresh, live model list, and mapping of Claude model names
   (`claude-sonnet-4-6-20260101` → `claude-sonnet-4.6`)
+- Connections to Copilot are kept open and reused: about 0.6 s less per request (see [Speed](#speed))
 
 > **Warning.** This is an unofficial, reverse-engineered client. It presents itself as VS Code Copilot Chat and uses
 > Copilot's internal endpoints, which is not supported by GitHub. Heavy or automated use may trigger GitHub's abuse
@@ -124,6 +125,7 @@ The proxy cuts both:
 | **Subagents on the cheap model:** `start -c` prints `CLAUDE_CODE_SUBAGENT_MODEL` = the Haiku model, because every subagent starts with a fresh, billed prompt | `--subagent-model` | 0.33 instead of 9 premium requests per subagent on legacy plans |
 | **Compaction window = Copilot's prompt limit:** `start -c` prints `CLAUDE_CODE_AUTO_COMPACT_WINDOW` from `/models` (200,000 for Sonnet 4.6), so a long session compacts before Copilot rejects it | printed env | – |
 | **Output clamp:** `max_tokens` is capped at the model's output limit, and `thinking.budget_tokens` is kept below it, so a request is never rejected and re-sent | always on | – |
+| **Fit to the model:** Claude Code sends the settings of the model it was told it has (adaptive thinking, an effort level, a per-turn effort message). When the proxy maps the request to a model without them, it turns adaptive thinking into a fixed budget and lowers or removes the effort, using the capabilities in Copilot's model list | always on | Claude Code 2.1.332 set to `claude-fable-5-2`, served by `claude-haiku-4.5`: before, 2 of 2 requests got a 400 and the run failed; after, 2 requests, none rejected, correct answer |
 | **`Retry-After` passed through:** on a Copilot 429/5xx the proxy forwards `retry-after` and the request id, so Claude Code's own retry waits the right time. Optional retries inside the proxy, before streaming, are for other clients; a rejected 429/5xx costs no tokens either way. | env `COPILOT_PROXY_RETRIES` (default 0) | – |
 | **Usage log:** one JSON line per request with input, cache read, cache write and output tokens, cleared tokens, route, model and initiator; totals and cache-hit ratio at `GET /stats` | `--usage-log FILE`, env `COPILOT_PROXY_USAGE_LOG` | – |
 
@@ -134,6 +136,27 @@ Claude Code settings that also cut tokens (all exist in Claude Code 2.1.330):
 - `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE` makes compaction start earlier.
 
 Don't set `DISABLE_PROMPT_CACHING`.
+
+## Speed
+
+The proxy keeps its connections to Copilot open and reuses them: up to 8, each for at most 90 s of idle
+time (Copilot itself closes an idle connection between 90 and 120 s, measured). A request then skips the new TLS
+connection, which took 524 ms here (median of 5).
+
+Measured on 2026-11-26 with the previous and the current proxy running side by side, calls alternating:
+
+| | Before | After |
+|---|---|---|
+| `count_tokens` (2,984 input tokens), median of 11 calls after the first | 941 ms | 355 ms |
+| Time to the first byte of a streamed answer (`gpt-4o-mini`), median of 7 calls after the first | 1,141 ms | 536 ms |
+| Forwarding a 20,000-event stream on loopback (fake upstream) | 452–597 ms | 287–291 ms |
+| Writes to the client for that stream | 60,000 | 20,025 |
+
+- The first request after a start, or after a pause longer than the idle limit, still opens a connection.
+- If Copilot has closed a kept connection, the proxy sees it before sending (5 of 5 in a live test). If the close
+  arrives while the request goes out, the proxy sends the request once more on a new connection.
+- A native or OpenAI stream is forwarded in the pieces it arrives in, not line by line, and request bodies are sent
+  as compact JSON.
 
 ## Copilot API version
 
@@ -210,6 +233,7 @@ the environment also reaches the commands Claude Code runs; `CLAUDE_CODE_SUBPROC
 - Browser requests that carry an `Origin` get 403, and no CORS headers are sent. This stops any web page from using
   your account. Allow an origin with `--cors-origin`.
 - If you bind to `0.0.0.0`, anyone who can reach the port uses your Copilot account.
+- `-H ::1` listens on IPv6.
 
 ## Endpoints
 - `POST /v1/messages`: Anthropic Messages, with or without streaming
@@ -223,17 +247,40 @@ the environment also reaches the commands Claude Code runs; `CLAUDE_CODE_SUBPROC
 - `GET /health`
 - `GET /token`: disabled unless you pass `--show-token`
 
+## Errors
+Every failure gets an answer; the proxy doesn't close the connection without one.
+- A request the proxy can't read gets a 400: invalid JSON, `messages` that isn't a list of objects, a `max_tokens`
+  that isn't a positive integer. A body over 64 MB gets a 413.
+- A Copilot error is passed on with its status, body and `retry-after`.
+- If GitHub or Copilot can't be reached, the answer is a 502. In the default mode `/v1/models` still lists the
+  three models; with `--any-model` it answers 502 until the model list can be loaded.
+- After a stream has started, a failure is sent as an `event: error`. On the translated route this includes an
+  error object inside Copilot's stream and a stream that ends before its finish reason.
+- Text cut in the middle of an emoji (half a surrogate pair) is forwarded as it arrived.
+
 ## Notes
 - On the translated route (non-Claude models), Anthropic `thinking` blocks in the history are dropped, because the
   OpenAI format has no field for them. Anthropic server tools (for example `web_search`) are not forwarded. The
   native route keeps both.
 - Follow-up turns in a tool loop are sent with `X-Initiator: agent`, as copilot-api does. Fresh prompts, including
   a subagent's first prompt, are sent as `user`: the proxy never relabels a new prompt to avoid billing.
+  The last user or assistant message decides. A per-turn control message that Claude Code adds after a tool result
+  (`{"role": "system", "content": [], "output_config": {...}}`) doesn't turn the follow-up into a new prompt.
 
 ## Tests
-`python3 test_offline.py` runs 21 checks against a fake Copilot upstream on 127.0.0.1: both message routes, streaming,
-tool calls, `count_tokens`, the initiator rule, the default model mapping, Host/Origin/key checks, malformed
-requests, the local rate limit and the model-list reload. It needs no network, login or Copilot quota.
+`python3 test_offline.py` runs 90 checks against a fake Copilot upstream on 127.0.0.1. It needs no network, login or
+Copilot quota, and passes on Python 3.9 to 3.12. `python3 test_offline.py stream pool` runs only the groups whose
+name contains one of the words.
+
+| Group | Checks |
+|---|---|
+| Request, response and stream translation | 8 |
+| Model mapping, Claude Code env, context editing, helpers | 17 |
+| Routes (native, translated, OpenAI, count_tokens, stats) | 14 |
+| Malformed requests, Host / Origin / key | 17 |
+| Copilot errors, retries, fallback, unreachable upstream | 14 |
+| Context editing over the wire, fit to the model, rate limit, manual approval | 13 |
+| Connection reuse, IPv6 and Unix-socket listeners | 7 |
 
 ## License
 MIT. See `LICENSE`.

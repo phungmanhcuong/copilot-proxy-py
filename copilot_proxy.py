@@ -4,17 +4,19 @@ copilot_proxy.py - single-file, standard-library-only proxy that lets the Claude
 (Anthropic Messages API) and OpenAI clients use a GitHub Copilot subscription.
 
 Python port of the design of github.com/ericc-ch/copilot-api, with these additions:
-  * an upstream error after streaming started is sent as an Anthropic `event: error`,
-    not as a second HTTP response inside the open stream;
-  * tool calls are buffered per index and emitted as complete blocks, so argument
+  * Claude models go through Copilot's native /v1/messages (prompt cache kept), with exact count_tokens and
+    stepped server-side context editing; other models are translated to /chat/completions;
+  * connections to Copilot are kept open and reused, so a request does not pay a new TLS handshake;
+  * a native request is fitted to the model Copilot serves (output limit, thinking mode, effort level), so that
+    Claude Code's settings for another model are not rejected;
+  * every failure gets an answer: an HTTP error before the stream starts, an Anthropic `event: error` after;
+  * on the translated route tool calls are buffered per index and emitted as complete blocks, so argument
     deltas can never land on a closed block;
-  * `--manual` approval prompts are serialised with one lock;
   * only the three Claude 5.5 models by default, every request mapped by family and printed as the
     Claude Code variables (ANTHROPIC_DEFAULT_*_MODEL); with --any-model the live /models catalog, where an
     unknown model re-fetches the catalog and falls back to a real chat model;
   * an existing Copilot editor login (~/.config/github-copilot/apps.json) is reused;
-  * Claude models go through Copilot's native /v1/messages (prompt cache kept), with exact count_tokens and
-    stepped server-side context editing;
+  * `--manual` approval prompts are serialised with one lock;
   * Unix-socket listener (ANTHROPIC_UNIX_SOCKET), optional client key, Claude Code sandbox settings, a macOS
     sandbox-exec mode for the proxy itself, and HTTPS_PROXY support.
 
@@ -29,17 +31,19 @@ import hmac
 import http.client
 import json
 import logging
+import math
 import os
 import re
 import secrets
+import select
 import shlex
 import signal
 import socket
 import socketserver
 import ssl
 import stat
-import tempfile
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
@@ -48,7 +52,7 @@ import urllib.request
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Iterator, Optional
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -89,27 +93,6 @@ PREFERRED_MODELS = {
     "haiku": os.environ.get("COPILOT_PROXY_DEFAULT_HAIKU", "claude-haiku-5.5"),
 }
 
-DEFAULT_PORT = 4141
-DEFAULT_HOST = "127.0.0.1"
-# Upstream 429/5xx retries before streaming. Default 0: Claude Code's SDK already retries on Retry-After (which
-# the proxy forwards), and a rejected 429/5xx costs no tokens, so proxy-side retries only help other clients.
-try:
-    RETRIES = max(0, min(5, int(os.environ.get("COPILOT_PROXY_RETRIES", "0"))))
-except ValueError:
-    RETRIES = 0
-RETRY_STATUSES = (429, 500, 502, 503, 504, 529)
-MAX_RETRY_WAIT = 20.0  # longer Retry-After values go back to the client instead of blocking here
-CONNECT_TIMEOUT = 15
-REQUEST_TIMEOUT = 600
-MAX_BODY = 64 * 1024 * 1024  # largest accepted request body (Claude Code sends images base64-encoded)
-
-# Server-side context editing on the native Claude route, with the values the official Copilot client sends
-# (microsoft/vscode extensions/copilot platform/networking/common/anthropic.ts buildContextManagement): once a
-# request is over CLEAR_TRIGGER input tokens, Copilot replaces all but the last CLEAR_KEEP tool results with a
-# placeholder. Only added when the client sent no `context_management` of its own.
-CONTEXT_EDIT_MODES = ("off", "tools", "thinking", "both")
-CONTEXT_MANAGEMENT_BETA = "context-management-2025-06-27"
-
 
 def _env_int(name: str, default: int, lo: int, hi: int) -> int:
     try:
@@ -118,6 +101,29 @@ def _env_int(name: str, default: int, lo: int, hi: int) -> int:
         return default
 
 
+DEFAULT_PORT = 4141
+DEFAULT_HOST = "127.0.0.1"
+# Upstream 429/5xx retries before streaming. Default 0: Claude Code's SDK already retries on Retry-After (which
+# the proxy forwards), and a rejected 429/5xx costs no tokens, so proxy-side retries only help other clients.
+RETRIES = _env_int("COPILOT_PROXY_RETRIES", 0, 0, 5)
+RETRY_STATUSES = (429, 500, 502, 503, 504, 529)
+MAX_RETRY_WAIT = 20.0  # longer Retry-After values go back to the client instead of blocking here
+CONNECT_TIMEOUT = 15   # seconds to reach GitHub or Copilot (TCP + TLS), and for each short GitHub API call
+REQUEST_TIMEOUT = 600  # longest silence accepted from Copilot while it answers
+MAX_BODY = 64 * 1024 * 1024  # largest accepted request body (Claude Code sends images base64-encoded)
+# Idle connections to Copilot kept for the next request. Measured 2026-11: a new TLS connection to
+# api.individual.githubcopilot.com took 524 ms (median of 5); Copilot kept an idle connection open for 90 s and
+# had closed it by 120 s.
+POOL_MAX_IDLE = 8
+POOL_IDLE_SECONDS = 90.0
+JSON_TYPE = "application/json; charset=utf-8"
+
+# Server-side context editing on the native Claude route, with the values the official Copilot client sends
+# (microsoft/vscode extensions/copilot platform/networking/common/anthropic.ts buildContextManagement): once a
+# request is over CLEAR_TRIGGER input tokens, Copilot replaces all but the last CLEAR_KEEP tool results with a
+# placeholder. Only added when the client sent no `context_management` of its own.
+CONTEXT_EDIT_MODES = ("off", "tools", "thinking", "both")
+CONTEXT_MANAGEMENT_BETA = "context-management-2025-06-27"
 CLEAR_TRIGGER = _env_int("COPILOT_PROXY_CLEAR_TRIGGER", 100000, 1000, 10_000_000)
 CLEAR_KEEP = _env_int("COPILOT_PROXY_CLEAR_KEEP", 3, 0, 1000)
 CLEAR_STEP = _env_int("COPILOT_PROXY_CLEAR_STEP", 10, 1, 1000)
@@ -138,10 +144,43 @@ def default_copilot_config_dir() -> Path:
 
 
 # ---------------------------------------------------------------------------
-# HTTP helpers
+# JSON and HTTP helpers
 # ---------------------------------------------------------------------------
 
 _SSL = ssl.create_default_context()
+
+
+class UpstreamError(RuntimeError):
+    """GitHub or Copilot could not be reached, refused the login, or sent an unreadable answer (client: 502)."""
+
+
+def _dumps(obj: Any) -> bytes:
+    """Compact UTF-8 JSON. Text cut in the middle of an emoji holds half a surrogate pair, which UTF-8 cannot
+    encode; such a document is written with \\u escapes instead, the way it arrived."""
+    try:
+        return json.dumps(obj, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    except UnicodeEncodeError:
+        return json.dumps(obj, separators=(",", ":")).encode("ascii")
+
+
+def _json_object(raw: Any) -> dict[str, Any]:
+    """Parse JSON bytes/str; anything that is not a JSON object becomes {}."""
+    try:
+        v = json.loads(raw) if raw else {}
+    except (ValueError, TypeError, RecursionError):
+        return {}
+    return v if isinstance(v, dict) else {}
+
+
+def _dict_get(d: Any, key: str) -> dict[str, Any]:
+    v = d.get(key) if isinstance(d, dict) else None
+    return v if isinstance(v, dict) else {}
+
+
+def _dicts(items: Any) -> list[dict[str, Any]]:
+    """The objects in a JSON list (content blocks, messages, choices). A string, null or any other value has
+    none, so callers can loop over client or Copilot data without checking its shape first."""
+    return [i for i in items if isinstance(i, dict)] if isinstance(items, list) else []
 
 
 def http_json_request(
@@ -149,31 +188,26 @@ def http_json_request(
     url: str,
     headers: Optional[dict[str, str]] = None,
     payload: Optional[dict[str, Any]] = None,
-    timeout: int = 30,
-) -> tuple[int, dict[str, str], Any]:
-    """JSON request via urllib. Returns (status, headers, parsed body); never raises on HTTP errors."""
-    data = json.dumps(payload).encode("utf-8") if payload is not None else None
-    req_headers = {"Accept": "application/json"}
-    if data is not None:
-        req_headers["Content-Type"] = "application/json"
-    if headers:
-        req_headers.update(headers)
+    timeout: float = CONNECT_TIMEOUT,
+) -> tuple[int, dict[str, Any]]:
+    """One short JSON request to GitHub or Copilot via urllib (which honours HTTPS_PROXY). Never raises: returns
+    (status, body). Status 0 means no answer (network error). The body is always a dict; an answer that is not
+    a JSON object is returned as {"error": text}."""
+    data = _dumps(payload) if payload is not None else None
+    req_headers = {"Accept": "application/json", **({"Content-Type": "application/json"} if data else {}),
+                   **(headers or {})}
     req = urllib.request.Request(url, data=data, headers=req_headers, method=method)
-
-    def parse(raw: str, fallback: Any) -> Any:
-        try:
-            return json.loads(raw) if raw else fallback
-        except json.JSONDecodeError:
-            return {"raw": raw}
-
     try:
         with urllib.request.urlopen(req, timeout=timeout, context=_SSL) as resp:
-            raw = resp.read().decode("utf-8", errors="replace")
-            return resp.status, dict(resp.headers.items()), parse(raw, {})
+            status, raw = resp.status, resp.read()
     except urllib.error.HTTPError as exc:
-        raw = exc.read().decode("utf-8", errors="replace")
-        hdrs = dict(exc.headers.items()) if exc.headers else {}
-        return exc.code, hdrs, parse(raw, {"error": str(exc.reason)})
+        status, raw = exc.code, exc.read()
+    except (OSError, http.client.HTTPException) as exc:  # no route, DNS, TLS, timeout
+        return 0, {"error": f"{type(exc).__name__}: {exc}"}
+    body = _json_object(raw)
+    if not body and raw.strip() not in (b"", b"{}"):
+        body = {"error": raw.decode("utf-8", errors="replace")[:2000]}
+    return status, body
 
 
 def _retry_after(header: Optional[str], attempt: int) -> Optional[float]:
@@ -187,20 +221,6 @@ def _retry_after(header: Optional[str], attempt: int) -> Optional[float]:
             return None
         return wait
     return min(MAX_RETRY_WAIT, 1.5 * (2 ** attempt))
-
-
-def _json_or_none(raw: Any) -> dict[str, Any]:
-    """Parse JSON bytes/str; anything that is not a JSON object becomes {}."""
-    try:
-        v = json.loads(raw) if raw else {}
-    except (ValueError, TypeError):
-        return {}
-    return v if isinstance(v, dict) else {}
-
-
-def _dict_get(d: Any, key: str) -> dict[str, Any]:
-    v = d.get(key) if isinstance(d, dict) else None
-    return v if isinstance(v, dict) else {}
 
 
 def _route_unsupported(status: int, raw: bytes) -> bool:
@@ -234,32 +254,6 @@ def host_name(value: str) -> Optional[str]:
     return f"[{m.group(1)}]" if m.group(1) else m.group(2).rstrip(".")
 
 
-def open_upstream(
-    base_url: str, path: str, method: str, headers: dict[str, str], body: Optional[bytes]
-) -> tuple[http.client.HTTPConnection, http.client.HTTPResponse]:
-    """Raw connection so a streamed (SSE) body can be read line by line. Honours HTTPS_PROXY / HTTP_PROXY /
-    NO_PROXY like urllib does (HTTPS through an HTTP CONNECT tunnel)."""
-    parsed = urllib.parse.urlsplit(base_url)
-    host = parsed.hostname or ""
-    full_path = parsed.path.rstrip("/") + path
-    proxy = upstream_proxy(parsed.scheme, host)
-    if parsed.scheme == "https":
-        if proxy:
-            conn: http.client.HTTPConnection = http.client.HTTPSConnection(
-                proxy[0], proxy[1], timeout=REQUEST_TIMEOUT, context=_SSL)
-            conn.set_tunnel(host, parsed.port or 443, headers=proxy[2])
-        else:
-            conn = http.client.HTTPSConnection(host, parsed.port or 443, timeout=REQUEST_TIMEOUT, context=_SSL)
-    elif proxy:
-        conn = http.client.HTTPConnection(proxy[0], proxy[1], timeout=REQUEST_TIMEOUT)
-        full_path = urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, full_path, "", ""))
-        headers = {**headers, **proxy[2]}
-    else:
-        conn = http.client.HTTPConnection(host, parsed.port or 80, timeout=REQUEST_TIMEOUT)
-    conn.request(method, full_path, body=body, headers=headers)
-    return conn, conn.getresponse()
-
-
 def upstream_proxy(scheme: str, host: str) -> Optional[tuple[str, int, dict[str, str]]]:
     """(proxy host, port, Proxy-Authorization header) from the environment, or None."""
     if not host or urllib.request.proxy_bypass(host):
@@ -281,6 +275,165 @@ def upstream_proxy(scheme: str, host: str) -> Optional[tuple[str, int, dict[str,
         cred = f"{urllib.parse.unquote(p.username)}:{urllib.parse.unquote(p.password or '')}"
         auth["Proxy-Authorization"] = "Basic " + base64.b64encode(cred.encode()).decode()
     return p.hostname, port, auth
+
+
+# ---------------------------------------------------------------------------
+# Connections to Copilot
+# ---------------------------------------------------------------------------
+
+
+class _Link:
+    """An open connection to Copilot and what a request on it needs: the path prefix and, through a plain-HTTP
+    proxy, the proxy credentials."""
+
+    __slots__ = ("http", "prefix", "headers", "idle_since")
+
+    def __init__(self, conn: http.client.HTTPConnection, prefix: str, headers: dict[str, str]):
+        self.http, self.prefix, self.headers, self.idle_since = conn, prefix, headers, 0.0
+
+
+def _connect(base_url: str) -> _Link:
+    """New connection to the upstream. Honours HTTPS_PROXY / HTTP_PROXY / NO_PROXY like urllib does (HTTPS
+    through an HTTP CONNECT tunnel)."""
+    url = urllib.parse.urlsplit(base_url)
+    host, tls = url.hostname or "", url.scheme == "https"
+    port = url.port or (443 if tls else 80)
+    prefix, extra = url.path.rstrip("/"), {}
+    proxy = upstream_proxy(url.scheme, host)
+    if tls:
+        conn: http.client.HTTPConnection = http.client.HTTPSConnection(
+            *(proxy[:2] if proxy else (host, port)), timeout=CONNECT_TIMEOUT, context=_SSL)
+        if proxy:
+            conn.set_tunnel(host, port, headers=proxy[2])
+    elif proxy:  # plain HTTP through a proxy: the full URL and the credentials go on every request
+        conn = http.client.HTTPConnection(proxy[0], proxy[1], timeout=CONNECT_TIMEOUT)
+        prefix, extra = f"{url.scheme}://{url.netloc}{prefix}", proxy[2]
+    else:
+        conn = http.client.HTTPConnection(host, port, timeout=CONNECT_TIMEOUT)
+    conn.auto_open = 0  # a closed link is never silently reopened (it would keep the short connect timeout)
+    try:
+        conn.connect()
+        conn.sock.settimeout(REQUEST_TIMEOUT)
+    except BaseException:
+        conn.close()
+        raise
+    return _Link(conn, prefix, extra)
+
+
+def _looks_open(conn: http.client.HTTPConnection) -> bool:
+    """False when the other side has closed an idle connection (its socket turned readable)."""
+    if conn.sock is None:
+        return False
+    try:
+        return not select.select([conn.sock], [], [], 0)[0]
+    except (OSError, ValueError):
+        return False
+
+
+class UpstreamResponse:
+    """One answer from Copilot. Read it whole with body() (kept, so it can be read again) or as it arrives with
+    lines() / blocks(). Once it is read to the end its connection goes back to the pool; close() ends an answer
+    that was not read to the end by closing the connection."""
+
+    def __init__(self, pool: UpstreamPool, key: str, link: _Link, resp: http.client.HTTPResponse):
+        self.status = resp.status
+        self._pool, self._key, self._resp = pool, key, resp
+        self._link: Optional[_Link] = link
+        self._body: Optional[bytes] = None
+        self._complete = False
+
+    def header(self, name: str, default: str = "") -> str:
+        return self._resp.getheader(name) or default
+
+    def body(self) -> bytes:
+        if self._body is None:
+            self._body = self._resp.read()
+            self._complete = True
+            self.close()
+        return self._body
+
+    def lines(self) -> Iterator[bytes]:
+        return self._until_end(self._resp.readline)
+
+    def blocks(self) -> Iterator[bytes]:
+        """The body in the pieces it arrives in (one socket read each), for forwarding without delay."""
+        return self._until_end(lambda: self._resp.read1(65536))
+
+    def _until_end(self, read: Callable[[], bytes]) -> Iterator[bytes]:
+        while True:
+            data = read()
+            if not data:
+                break
+            yield data
+        self._resp.read()  # nothing is left; marks the response as finished on every Python version
+        self._complete = True
+        self.close()
+
+    def close(self) -> None:
+        link, self._link = self._link, None
+        if link is None:
+            return
+        if self._complete and not self._resp.will_close:
+            self._pool.give(self._key, link)
+        else:
+            link.http.close()
+
+
+class UpstreamPool:
+    """Idle keep-alive connections to Copilot, per base URL, so that only the first request pays for TCP + TLS."""
+
+    # what a request on a kept connection raises when Copilot closed it in the meantime
+    STALE = (ConnectionError, http.client.BadStatusLine, ssl.SSLError)
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._idle: dict[str, list[_Link]] = {}
+
+    def post(self, base_url: str, path: str, headers: dict[str, str], body: bytes) -> UpstreamResponse:
+        link = self._take(base_url)
+        reused = link is not None
+        while True:
+            link = link or _connect(base_url)
+            try:
+                link.http.request("POST", link.prefix + path, body=body, headers={**headers, **link.headers})
+                return UpstreamResponse(self, base_url, link, link.http.getresponse())
+            except BaseException as exc:
+                link.http.close()
+                # Copilot can close a kept connection just as the request goes out: once more, on a new one
+                if not (reused and isinstance(exc, self.STALE)):
+                    raise
+                link, reused = None, False
+
+    def _take(self, key: str) -> Optional[_Link]:
+        while True:
+            with self._lock:
+                links = self._idle.get(key)
+                if not links:
+                    return None
+                link = links.pop()  # the newest; older ones age out
+            if time.monotonic() - link.idle_since < POOL_IDLE_SECONDS and _looks_open(link.http):
+                return link
+            link.http.close()
+
+    def give(self, key: str, link: _Link) -> None:
+        link.idle_since = time.monotonic()
+        with self._lock:
+            links = self._idle.setdefault(key, [])
+            links.append(link)
+            dropped = links[:-POOL_MAX_IDLE]
+            del links[:-POOL_MAX_IDLE]
+        for old in dropped:
+            old.http.close()
+
+    def clear(self) -> None:
+        with self._lock:
+            links = [link for group in self._idle.values() for link in group]
+            self._idle.clear()
+        for link in links:
+            link.http.close()
+
+
+UPSTREAM = UpstreamPool()
 
 
 # ---------------------------------------------------------------------------
@@ -338,13 +491,13 @@ def save_github_token(path: Path, token: str) -> None:
 
 
 def copilot_token_works(github_token: str) -> tuple[bool, int]:
-    status, _, data = http_json_request(
-        "GET",
-        f"{GITHUB_API_BASE_URL}/copilot_internal/v2/token",
-        headers=github_headers(github_token),
-        timeout=CONNECT_TIMEOUT,
-    )
-    return status == 200 and isinstance(data, dict) and "token" in data, status
+    """Whether GitHub exchanges this login for a Copilot token. Raises UpstreamError when GitHub cannot be
+    reached, so that an outage is not taken for a rejected login."""
+    status, data = http_json_request(
+        "GET", f"{GITHUB_API_BASE_URL}/copilot_internal/v2/token", github_headers(github_token))
+    if status == 0:
+        raise UpstreamError(f"Cannot reach {GITHUB_API_BASE_URL}: {data.get('error')}")
+    return status == 200 and "token" in data, status
 
 
 def token_from_copilot_config(config_dir: Path) -> Optional[str]:
@@ -380,14 +533,14 @@ def token_from_copilot_config(config_dir: Path) -> Optional[str]:
 
 def run_device_auth_flow(token_path: Path, show_token: bool = False) -> str:
     """GitHub OAuth device flow (RFC 8628)."""
-    status, _, data = http_json_request(
+    status, data = http_json_request(
         "POST",
         f"{GITHUB_BASE_URL}/login/device/code",
         headers=github_headers(),
         payload={"client_id": GITHUB_CLIENT_ID, "scope": "read:user"},
     )
     if status != 200 or "device_code" not in data:
-        raise RuntimeError(f"GitHub device flow start failed ({status}): {data}")
+        raise UpstreamError(f"GitHub device flow start failed ({status}): {data}")
 
     interval = int(data.get("interval", 5))
     expires_at = time.time() + int(data.get("expires_in", 900))
@@ -398,7 +551,7 @@ def run_device_auth_flow(token_path: Path, show_token: bool = False) -> str:
 
     while time.time() < expires_at:
         time.sleep(interval)
-        _, _, p = http_json_request(
+        status, p = http_json_request(
             "POST",
             f"{GITHUB_BASE_URL}/login/oauth/access_token",
             payload={
@@ -407,20 +560,17 @@ def run_device_auth_flow(token_path: Path, show_token: bool = False) -> str:
                 "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
             },
         )
-        if isinstance(p, dict) and p.get("access_token"):
+        if p.get("access_token"):
             save_github_token(token_path, p["access_token"])
             print(f"Login succeeded; token saved to {token_path}")
             if show_token:
                 print(f"GitHub token: {p['access_token']}")
             return p["access_token"]
-        err = p.get("error") if isinstance(p, dict) else None
-        if err == "authorization_pending":
-            continue
-        if err == "slow_down":
+        if p.get("error") == "slow_down":
             interval += 5
-            continue
-        raise RuntimeError(f"GitHub device flow failed: {p}")
-    raise TimeoutError("GitHub device authorization timed out.")
+        elif status != 0 and p.get("error") != "authorization_pending":  # a network error waits for the next poll
+            raise UpstreamError(f"GitHub device flow failed: {p}")
+    raise UpstreamError("GitHub device authorization timed out.")
 
 
 class TokenManager:
@@ -437,24 +587,20 @@ class TokenManager:
 
     @property
     def api_base_url(self) -> str:
-        with self._lock:
-            return self._base_url
+        return self._base_url
 
     def get_token(self, force_refresh: bool = False) -> tuple[str, str]:
+        """(Copilot token, API base URL). Raises UpstreamError when the token exchange fails."""
         with self._lock:
             if not force_refresh and self._token and time.time() < self._expires_at - 60:
                 return self._token, self._base_url
             return self._refresh_locked()
 
     def _refresh_locked(self) -> tuple[str, str]:
-        status, _, data = http_json_request(
-            "GET",
-            f"{GITHUB_API_BASE_URL}/copilot_internal/v2/token",
-            headers=github_headers(self.github_token),
-            timeout=CONNECT_TIMEOUT,
-        )
-        if status != 200 or "token" not in data:
-            raise RuntimeError(f"GitHub -> Copilot token exchange failed ({status}): {data}")
+        status, data = http_json_request(
+            "GET", f"{GITHUB_API_BASE_URL}/copilot_internal/v2/token", github_headers(self.github_token))
+        if status != 200 or not isinstance(data.get("token"), str):
+            raise UpstreamError(f"GitHub -> Copilot token exchange failed ({status}): {str(data)[:300]}")
         self._token = data["token"]
         exp = data.get("expires_at")
         if isinstance(exp, (int, float)) and exp > time.time():
@@ -490,14 +636,9 @@ class TokenManager:
     def stop(self) -> None:
         self._stop.set()
 
-    def fetch_usage(self) -> tuple[int, Any]:
-        status, _, data = http_json_request(
-            "GET",
-            f"{GITHUB_API_BASE_URL}/copilot_internal/user",
-            headers=github_headers(self.github_token),
-            timeout=CONNECT_TIMEOUT,
-        )
-        return status, data
+    def fetch_usage(self) -> tuple[int, dict[str, Any]]:
+        return http_json_request(
+            "GET", f"{GITHUB_API_BASE_URL}/copilot_internal/user", github_headers(self.github_token))
 
     @staticmethod
     def copilot_headers(token: str, is_agent: bool = False, is_vision: bool = False) -> dict[str, str]:
@@ -528,25 +669,26 @@ _APPROVAL_LOCK = threading.Lock()
 
 
 class RequestGuard:
+    """The optional pause between upstream requests (-r, -w) and the y/N approval of each one (--manual)."""
+
     def __init__(self, rate_limit_seconds: Optional[float], wait_on_limit: bool, manual_approval: bool):
-        self.rate_limit_seconds = rate_limit_seconds
+        self.rate_limit_seconds = rate_limit_seconds or 0.0
         self.wait_on_limit = wait_on_limit
         self.manual_approval = manual_approval
         self._lock = threading.Lock()
-        self._last = 0.0
+        self._next = 0.0  # monotonic time from which the next request may pass
 
     def check(self, summary: str) -> tuple[bool, Optional[float]]:
         """(allowed, retry_after). retry_after None + not allowed = rejected by the operator."""
-        if self.rate_limit_seconds and self.rate_limit_seconds > 0:
+        if self.rate_limit_seconds > 0:
             with self._lock:
-                elapsed = time.time() - self._last
-                if self._last > 0 and elapsed < self.rate_limit_seconds:
-                    remaining = self.rate_limit_seconds - elapsed
+                wait = self._next - time.monotonic()
+                if wait > 0:
                     if not self.wait_on_limit:
-                        return False, remaining
-                    LOG.info("Rate limit: waiting %.1fs", remaining)
-                    time.sleep(remaining)
-                self._last = time.time()
+                        return False, wait
+                    LOG.info("Rate limit: waiting %.1fs", wait)
+                    time.sleep(wait)
+                self._next = time.monotonic() + self.rate_limit_seconds
 
         if self.manual_approval:
             with _APPROVAL_LOCK:  # one prompt at a time; Claude Code sends requests in parallel
@@ -569,6 +711,11 @@ def _version_key(model_id: str) -> tuple:
 
 
 class ModelCatalog:
+    """Copilot's model list (GET /models) and the mapping from the model a client asks for to the one used."""
+
+    MAX_AGE = 300.0     # seconds before the list is fetched again
+    RETRY_PAUSE = 60.0  # seconds between attempts while the fetch fails
+
     def __init__(self, tm: TokenManager, primary: Optional[str] = None, small: Optional[str] = None,
                  any_model: bool = False):
         self.tm = tm
@@ -581,53 +728,54 @@ class ModelCatalog:
         self.primary = primary
         self.small = small
         self._lock = threading.Lock()
+        # the three below are replaced as a whole by a fetch, never changed in place, so reads need no lock
         self._payload: dict[str, Any] = {"object": "list", "data": []}
         self._models: dict[str, dict[str, Any]] = {}
+        self._chat_ids: list[str] = []
         self._fetched = 0.0
         self._retry_at = 0.0
 
-    def ensure_loaded(self) -> None:
-        """Fetch the model list again when the last fetch failed (at most once a minute). Without it a network
-        error at startup would leave every request on the translated route, without the prompt cache."""
+    def refresh(self, max_age: float = MAX_AGE) -> bool:
+        """Fetch the list when the copy is older than max_age seconds (0 = now). A failed fetch is logged, not
+        raised, and not repeated for RETRY_PAUSE seconds: the proxy keeps serving with what it has. Returns
+        whether a list is loaded."""
+        now = time.monotonic()
         with self._lock:
-            if self._models or time.time() < self._retry_at:
-                return
-            self._retry_at = time.time() + 60
-        self._fetch()
-
-    def get_models_payload(self, force: bool = False) -> dict[str, Any]:
-        with self._lock:
-            fresh = not force and self._models and time.time() - self._fetched < 300
-        if not fresh:
-            self._fetch()
-        with self._lock:
-            payload = self._payload
-            models = dict(self._models)
-        if not self.only:
-            return payload
-        # only the three enabled models; one Copilot does not list yet gets a minimal entry
-        data = [models.get(mid) or {"id": mid, "object": "model", "name": mid, "vendor": "Anthropic"}
-                for mid in self.only.values()]
-        return {**payload, "data": data}
-
-    def _fetch(self) -> None:
-        token, base = self.tm.get_token()
-        status, _, data = http_json_request(
-            "GET", f"{base}/models", headers=self.tm.copilot_headers(token), timeout=CONNECT_TIMEOUT
-        )
-        if status == 401:
-            token, base = self.tm.get_token(force_refresh=True)
-            status, _, data = http_json_request(
-                "GET", f"{base}/models", headers=self.tm.copilot_headers(token), timeout=CONNECT_TIMEOUT
-            )
-        if status == 200 and isinstance(data, dict) and isinstance(data.get("data"), list):
+            fresh = self._models and now - self._fetched < max_age
+            if fresh or (max_age and now < self._retry_at):
+                return bool(self._models)
+            self._retry_at = now + self.RETRY_PAUSE  # also keeps parallel requests from all fetching at once
+        try:
+            token, base = self.tm.get_token()
+            status, data = http_json_request("GET", f"{base}/models", self.tm.copilot_headers(token))
+            if status == 401:
+                token, base = self.tm.get_token(force_refresh=True)
+                status, data = http_json_request("GET", f"{base}/models", self.tm.copilot_headers(token))
+        except UpstreamError as exc:
+            status, data = 0, {"error": str(exc)}
+        if status == 200 and isinstance(data.get("data"), list):
+            models = {m["id"]: m for m in data["data"] if isinstance(m, dict) and isinstance(m.get("id"), str)}
+            chat = sorted(mid for mid, m in models.items()
+                          if _dict_get(m, "capabilities").get("type", "chat") == "chat")
             with self._lock:
-                self._payload = data
-                self._models = {m["id"]: m for m in data["data"] if isinstance(m, dict) and "id" in m}
-                self._fetched = time.time()
-            LOG.info("Loaded %d Copilot models", len(self._models))
+                self._payload, self._models, self._chat_ids = data, models, chat
+                self._fetched, self._retry_at = time.monotonic(), 0.0
+            LOG.info("Loaded %d Copilot models", len(models))
         else:
             LOG.warning("Cannot fetch Copilot models (%s): %s", status, str(data)[:300])
+        return bool(self._models)
+
+    def get_models_payload(self, force: bool = False) -> dict[str, Any]:
+        """The answer to GET /v1/models. Raises UpstreamError when --any-model has no list to show."""
+        loaded = self.refresh(0.0 if force else self.MAX_AGE)
+        if self.only:
+            # only the three enabled models; one Copilot does not list yet gets a minimal entry
+            return {**self._payload, "data": [
+                self._models.get(mid) or {"id": mid, "object": "model", "name": mid, "vendor": "Anthropic"}
+                for mid in self.only.values()]}
+        if not loaded:
+            raise UpstreamError("Copilot's model list is not available")
+        return self._payload
 
     def family_id(self, name: Optional[str]) -> Optional[str]:
         """The enabled model for a name's family (opus / sonnet / haiku), or None."""
@@ -642,48 +790,45 @@ class ModelCatalog:
 
     def missing(self) -> list[str]:
         """Enabled models that this account's Copilot catalog does not list."""
-        ids = set(self.chat_model_ids())
-        return [m for m in (self.only or {}).values() if m not in ids]
+        return [m for m in (self.only or {}).values() if m not in self._chat_ids]
 
     def chat_model_ids(self) -> list[str]:
-        with self._lock:
-            models = dict(self._models)
-        ids = [
-            mid for mid, m in models.items()
-            if (m.get("capabilities") or {}).get("type", "chat") == "chat"
-        ]
-        return sorted(ids)
+        return self._chat_ids
 
     def newest(self, family: str) -> Optional[str]:
         """Default model for a family: the preferred Claude 5.5 id when this account's catalog serves it,
         otherwise the newest version Copilot lists (e.g. legacy annual plans, which get no new models)."""
         if self.only:
             return self.only.get(family)
-        ids = [m for m in self.chat_model_ids() if m.startswith("claude") and family in m]
+        ids = [m for m in self._chat_ids if m.startswith("claude") and family in m]
         preferred = PREFERRED_MODELS.get(family)
         if preferred and preferred in ids:
             return preferred
         return max(ids, key=_version_key) if ids else None
 
-    def max_output_tokens(self, model_id: str) -> Optional[int]:
-        with self._lock:
-            m = self._models.get(model_id) or {}
-        limit = ((m.get("capabilities") or {}).get("limits") or {}).get("max_output_tokens")
+    def _limit(self, model_id: str, name: str) -> Optional[int]:
+        limit = _dict_get(_dict_get(self._models.get(model_id), "capabilities"), "limits").get(name)
         return int(limit) if isinstance(limit, (int, float)) and limit > 0 else None
+
+    def max_output_tokens(self, model_id: str) -> Optional[int]:
+        return self._limit(model_id, "max_output_tokens")
 
     def max_prompt_tokens(self, model_id: str) -> Optional[int]:
-        with self._lock:
-            m = self._models.get(model_id) or {}
-        limit = ((m.get("capabilities") or {}).get("limits") or {}).get("max_prompt_tokens")
-        return int(limit) if isinstance(limit, (int, float)) and limit > 0 else None
+        return self._limit(model_id, "max_prompt_tokens")
+
+    def supports(self, model_id: str) -> dict[str, Any]:
+        """What Copilot lists as the model's capabilities (adaptive thinking, thinking budget, reasoning-effort
+        levels, ...); {} when the model or its capabilities are not known."""
+        return _dict_get(_dict_get(self._models.get(model_id), "capabilities"), "supports")
 
     def supports_endpoint(self, model_id: str, endpoint: str) -> bool:
-        with self._lock:
-            m = self._models.get(model_id) or {}
-        return endpoint in (m.get("supported_endpoints") or [])
+        """Whether Copilot lists this endpoint for the model. Loads the list first if the fetch at start failed:
+        without it every request would stay on the translated route, without the prompt cache."""
+        self.refresh(math.inf)
+        return endpoint in (_dict_get(self._models, model_id).get("supported_endpoints") or [])
 
     def resolve_model(self, requested: str) -> str:
-        """Map Anthropic ids (dated, hyphenated) to Copilot ids (dotted)."""
+        """Map the model a client asks for (Anthropic ids are dated and hyphenated) to a Copilot id (dotted)."""
         low = (requested or "").lower()
         if self.small and "haiku" in low:
             return self.small
@@ -692,36 +837,33 @@ class ModelCatalog:
         if self.only:
             return self.family_id(requested) or self.only["sonnet"]
 
-        available = set(self.chat_model_ids())
-        if not available:
-            self.get_models_payload(force=True)
-            available = set(self.chat_model_ids())
-        if requested in available:
-            return requested
-
         stripped = re.sub(r"-\d{8}$", "", requested or "").replace("-latest", "")
         stripped = re.sub(r"\[.*\]$", "", stripped)  # e.g. "claude-x[1m]"
         dotted = re.sub(r"-(\d+)-(\d+)", r"-\1.\2", stripped)
-        cands = [stripped, dotted]
+        cands = [requested, stripped, dotted]
         m = re.match(r"^claude-(sonnet|opus|haiku)-(\d+)(?:\.(\d+))?$", dotted)
         if m:
             fam, maj, minor = m.groups()
             if minor:
                 cands.append(f"claude-{maj}.{minor}-{fam}")
             cands.append(f"claude-{fam}-{maj}")
-        for c in cands:
-            if c in available:
-                LOG.debug("Model %s -> %s", requested, c)
-                return c
 
+        def listed() -> Optional[str]:
+            ids = set(self._chat_ids)
+            return next((c for c in cands if c in ids), None)
+
+        # not listed: load the list if it is missing or older than MAX_AGE (Copilot may have added the model)
+        found = listed() or (self.refresh() and listed()) or None
+        if found:
+            LOG.debug("Model %s -> %s", requested, found)
+            return found
         for fam in ("opus", "sonnet", "haiku"):
             if fam in low:
                 best = self.newest(fam)
                 if best:
                     LOG.info("Model %s not served; using newest %s: %s", requested, fam, best)
                     return best
-
-        fallback = self.newest("sonnet") or (sorted(available)[0] if available else None)
+        fallback = self.newest("sonnet") or (self._chat_ids[0] if self._chat_ids else None)
         if fallback:
             LOG.warning("Unknown model %s; using %s", requested, fallback)
             return fallback
@@ -750,8 +892,9 @@ def _blocks_text(content: Any) -> str:
 
 
 def _image_part(block: dict[str, Any]) -> Optional[dict[str, Any]]:
+    """An Anthropic image block as an OpenAI image_url part; None for any other block."""
     src = block.get("source")
-    if not isinstance(src, dict):
+    if block.get("type") != "image" or not isinstance(src, dict):
         return None
     if src.get("type") == "base64":
         return {"type": "image_url",
@@ -761,93 +904,103 @@ def _image_part(block: dict[str, Any]) -> Optional[dict[str, Any]]:
     return None
 
 
+def _assistant_message(content: Any) -> dict[str, Any]:
+    """An Anthropic assistant turn as one OpenAI message. thinking / redacted_thinking blocks are dropped: the
+    OpenAI schema has no slot for them."""
+    if isinstance(content, str):
+        return {"role": "assistant", "content": content}
+    texts: list[str] = []
+    calls: list[dict[str, Any]] = []
+    for b in _dicts(content):
+        if b.get("type") == "text":
+            texts.append(b.get("text", ""))
+        elif b.get("type") == "tool_use":
+            inp = b.get("input", {})
+            calls.append({
+                "id": b.get("id") or f"call_{uuid.uuid4().hex[:16]}",
+                "type": "function",
+                "function": {"name": b.get("name", ""),
+                             "arguments": inp if isinstance(inp, str)
+                             else json.dumps(inp, ensure_ascii=False, separators=(",", ":"))},
+            })
+    text = "\n".join(t for t in texts if t)
+    msg: dict[str, Any] = {"role": "assistant", "content": text or (None if calls else "")}
+    if calls:
+        msg["tool_calls"] = calls
+    return msg
+
+
+def _user_messages(content: Any) -> tuple[list[dict[str, Any]], bool]:
+    """An Anthropic user turn as OpenAI messages: one `tool` message per tool result (they must directly follow
+    the assistant's tool calls), then one user message with the text and images. Second value: has an image."""
+    if isinstance(content, str):
+        return [{"role": "user", "content": content}], False
+    out: list[dict[str, Any]] = []
+    parts: list[dict[str, Any]] = []
+    for b in _dicts(content):
+        kind = b.get("type")
+        if kind == "tool_result":
+            text = _blocks_text(b.get("content", ""))
+            if b.get("is_error") and not text.startswith("Error"):
+                text = f"Error: {text}" if text else "Error"
+            out.append({"role": "tool", "tool_call_id": b.get("tool_use_id", ""), "content": text})
+            # images inside a tool result (e.g. screenshots) go into the user message that follows
+            parts += [img for img in map(_image_part, _dicts(b.get("content"))) if img]
+        elif kind == "text":
+            parts.append({"type": "text", "text": b.get("text", "")})
+        elif kind == "image":
+            img = _image_part(b)
+            if img:
+                parts.append(img)
+    has_image = any(p["type"] == "image_url" for p in parts)
+    if parts:
+        out.append({"role": "user", "content": parts if has_image else "\n".join(p["text"] for p in parts)})
+    return out, has_image
+
+
+def _openai_tools(payload: dict[str, Any]) -> tuple[list[dict[str, Any]], Any]:
+    """(tools, tool_choice) in OpenAI form; tool_choice None = leave it out."""
+    tools = []
+    for tool in payload.get("tools") or []:
+        if not isinstance(tool, dict) or "name" not in tool:
+            continue
+        if "input_schema" not in tool and tool.get("type") not in (None, "custom"):
+            continue  # Anthropic server tools (web_search, ...) have no OpenAI equivalent
+        fn: dict[str, Any] = {"name": tool["name"],
+                              "parameters": tool.get("input_schema") or {"type": "object", "properties": {}}}
+        if tool.get("description"):
+            fn["description"] = tool["description"]
+        tools.append({"type": "function", "function": fn})
+    choice = _dict_get(payload, "tool_choice")
+    kind = choice.get("type")
+    if kind in ("auto", "none"):
+        return tools, kind
+    if kind == "any":
+        return tools, "required"
+    if kind == "tool" and choice.get("name"):
+        return tools, {"type": "function", "function": {"name": choice["name"]}}
+    return tools, None
+
+
 def anthropic_to_openai_request(
     payload: dict[str, Any], model: str, max_out: Optional[int] = None
 ) -> tuple[dict[str, Any], bool, bool]:
-    """Returns (openai_payload, is_agent_initiator, is_vision)."""
+    """An Anthropic Messages request as a Chat Completions request: (payload, is_agent_initiator, is_vision)."""
     msgs: list[dict[str, Any]] = []
-    is_agent = False
-    is_vision = False
-
     system = payload.get("system")
+    if isinstance(system, list):
+        system = "\n\n".join(b["text"] for b in _dicts(system) if b.get("type") == "text" and b.get("text"))
     if isinstance(system, str) and system:
         msgs.append({"role": "system", "content": system})
-    elif isinstance(system, list):
-        text = "\n\n".join(b.get("text", "") for b in system
-                           if isinstance(b, dict) and b.get("type") == "text" and b.get("text"))
-        if text:
-            msgs.append({"role": "system", "content": text})
 
+    is_vision = False
     for msg in payload.get("messages", []):
-        role = msg.get("role", "user")
-        content = msg.get("content", "")
-
-        if role == "assistant":
-            if isinstance(content, str):
-                msgs.append({"role": "assistant", "content": content})
-                continue
-            texts: list[str] = []
-            calls: list[dict[str, Any]] = []
-            for b in content if isinstance(content, list) else []:
-                if not isinstance(b, dict):
-                    continue
-                if b.get("type") == "text":
-                    texts.append(b.get("text", ""))
-                elif b.get("type") == "tool_use":
-                    inp = b.get("input", {})
-                    calls.append({
-                        "id": b.get("id") or f"call_{uuid.uuid4().hex[:16]}",
-                        "type": "function",
-                        "function": {"name": b.get("name", ""),
-                                     "arguments": inp if isinstance(inp, str) else json.dumps(inp, ensure_ascii=False)},
-                    })
-                # thinking / redacted_thinking blocks are dropped: the OpenAI schema has no slot for them
-            joined = "\n".join(t for t in texts if t)
-            am: dict[str, Any] = {"role": "assistant", "content": joined or (None if calls else "")}
-            if calls:
-                am["tool_calls"] = calls
-            msgs.append(am)
-            continue
-
-        if isinstance(content, str):
-            msgs.append({"role": "user", "content": content})
-            continue
-
-        tool_msgs: list[dict[str, Any]] = []
-        parts: list[dict[str, Any]] = []
-        has_image = False
-        for b in content if isinstance(content, list) else []:
-            if not isinstance(b, dict):
-                continue
-            t = b.get("type")
-            if t == "tool_result":
-                text = _blocks_text(b.get("content", ""))
-                if b.get("is_error") and not text.startswith("Error"):
-                    text = f"Error: {text}" if text else "Error"
-                tool_msgs.append({"role": "tool", "tool_call_id": b.get("tool_use_id", ""), "content": text})
-                # images inside a tool result (e.g. screenshots) go into the following user message
-                inner = b.get("content")
-                if isinstance(inner, list):
-                    for ib in inner:
-                        if isinstance(ib, dict) and ib.get("type") == "image":
-                            img = _image_part(ib)
-                            if img:
-                                parts.append(img)
-                                has_image = True
-            elif t == "text":
-                parts.append({"type": "text", "text": b.get("text", "")})
-            elif t == "image":
-                img = _image_part(b)
-                if img:
-                    parts.append(img)
-                    has_image = True
-        is_vision = is_vision or has_image
-        msgs.extend(tool_msgs)  # tool messages must directly follow the assistant tool_calls
-        if parts:
-            if has_image:
-                msgs.append({"role": "user", "content": parts})
-            else:
-                msgs.append({"role": "user", "content": "\n".join(p["text"] for p in parts)})
+        if msg.get("role") == "assistant":
+            msgs.append(_assistant_message(msg.get("content", "")))
+        else:
+            turn, has_image = _user_messages(msg.get("content", ""))
+            msgs += turn
+            is_vision = is_vision or has_image
 
     out: dict[str, Any] = {"model": model, "messages": msgs, "stream": bool(payload.get("stream"))}
     if out["stream"]:
@@ -863,31 +1016,12 @@ def anthropic_to_openai_request(
     meta = payload.get("metadata")
     if isinstance(meta, dict) and meta.get("user_id"):
         out["user"] = str(meta["user_id"])[:64]
-
-    tools = []
-    for tool in payload.get("tools") or []:
-        if not isinstance(tool, dict) or "name" not in tool:
-            continue
-        if "input_schema" not in tool and tool.get("type") not in (None, "custom"):
-            continue  # Anthropic server tools (web_search, ...) have no OpenAI equivalent
-        fn: dict[str, Any] = {"name": tool["name"],
-                              "parameters": tool.get("input_schema") or {"type": "object", "properties": {}}}
-        if tool.get("description"):
-            fn["description"] = tool["description"]
-        tools.append({"type": "function", "function": fn})
+    tools, choice = _openai_tools(payload)
     if tools:
         out["tools"] = tools
-        tc = payload.get("tool_choice")
-        if isinstance(tc, dict):
-            kind = tc.get("type")
-            if kind in ("auto", "none"):
-                out["tool_choice"] = kind
-            elif kind == "any":
-                out["tool_choice"] = "required"
-            elif kind == "tool" and tc.get("name"):
-                out["tool_choice"] = {"type": "function", "function": {"name": tc["name"]}}
-    is_agent = anthropic_flags(payload)[0]  # one initiator rule for both routes
-    return out, is_agent, is_vision
+        if choice is not None:
+            out["tool_choice"] = choice
+    return out, anthropic_flags(payload)[0], is_vision  # one initiator rule for both routes
 
 
 # ---------------------------------------------------------------------------
@@ -906,7 +1040,7 @@ def anthropic_usage(usage: Any) -> dict[str, int]:
     if not isinstance(usage, dict):
         return {"input_tokens": 0, "output_tokens": 0}
     prompt = int(usage.get("prompt_tokens") or 0)
-    cached = int(((usage.get("prompt_tokens_details") or {}).get("cached_tokens")) or 0)
+    cached = int(_dict_get(usage, "prompt_tokens_details").get("cached_tokens") or 0)
     out = {"input_tokens": max(0, prompt - cached), "output_tokens": int(usage.get("completion_tokens") or 0)}
     if cached:
         out["cache_read_input_tokens"] = cached
@@ -917,9 +1051,9 @@ def openai_usage(u: dict[str, Any]) -> dict[str, int]:
     """Chat Completions or Responses usage -> Anthropic-style fields (input excludes cached tokens)."""
     if not u:
         return {}
-    if "prompt_tokens" in u:
-        return anthropic_usage(u)
     try:
+        if "prompt_tokens" in u:
+            return anthropic_usage(u)
         cached = int(_dict_get(u, "input_tokens_details").get("cached_tokens") or 0)
         return {"input_tokens": max(0, int(u.get("input_tokens") or 0) - cached),
                 "cache_read_input_tokens": cached, "output_tokens": int(u.get("output_tokens") or 0)}
@@ -944,20 +1078,19 @@ def _msg_id(raw: Any) -> str:
 
 
 def openai_to_anthropic_response(resp: dict[str, Any], model: str) -> dict[str, Any]:
-    choices = resp.get("choices") or []
     blocks: list[dict[str, Any]] = []
     finish = None
     # Copilot can split one answer over several choices (text in one, tool calls in another)
-    for ch in choices:
-        m = ch.get("message") or {}
+    for ch in resp.get("choices") or []:
+        m = _dict_get(ch, "message")
         finish = ch.get("finish_reason") or finish
         reasoning = m.get("reasoning_content") or m.get("reasoning_text")
         if isinstance(reasoning, str) and reasoning:
             blocks.append({"type": "thinking", "thinking": reasoning, "signature": ""})
         if isinstance(m.get("content"), str) and m["content"]:
             blocks.append({"type": "text", "text": m["content"]})
-        for tc in m.get("tool_calls") or []:
-            fn = tc.get("function") or {}
+        for tc in _dicts(m.get("tool_calls")):
+            fn = _dict_get(tc, "function")
             blocks.append({"type": "tool_use", "id": tc.get("id") or f"toolu_{uuid.uuid4().hex[:16]}",
                            "name": fn.get("name", ""), "input": _parse_args(fn.get("arguments"))})
     if any(b["type"] == "tool_use" for b in blocks):
@@ -970,7 +1103,7 @@ def openai_to_anthropic_response(resp: dict[str, Any], model: str) -> dict[str, 
 
 
 def sse(event: str, data: dict[str, Any]) -> bytes:
-    return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False, separators=(',', ':'))}\n\n".encode()
+    return b"event: " + event.encode() + b"\ndata: " + _dumps(data) + b"\n\n"
 
 
 class StreamTranslator:
@@ -985,6 +1118,7 @@ class StreamTranslator:
         self.msg_id = _msg_id(None)
         self.started = False
         self.finished = False
+        self.finish_seen = False  # Copilot sent a finish_reason: the answer is complete
         self.next_index = 0
         self.open_index: Optional[int] = None
         self.open_type: Optional[str] = None
@@ -1026,21 +1160,20 @@ class StreamTranslator:
         if chunk.get("id") and not self.started:
             self.msg_id = _msg_id(chunk["id"])
         if isinstance(chunk.get("usage"), dict):
-            u = anthropic_usage(chunk["usage"])
-            self.usage.update({k: v for k, v in u.items() if v})
-        for choice in chunk.get("choices") or []:
+            self.usage.update({k: v for k, v in anthropic_usage(chunk["usage"]).items() if v})
+        for choice in _dicts(chunk.get("choices")):
             self._start(ev)
-            d = choice.get("delta") or {}
+            d = _dict_get(choice, "delta")
             r = d.get("reasoning_content") or d.get("reasoning_text")
             if isinstance(r, str) and r:
                 self._delta(ev, "thinking", {"type": "thinking_delta", "thinking": r})
             if isinstance(d.get("content"), str) and d["content"]:
                 self._delta(ev, "text", {"type": "text_delta", "text": d["content"]})
-            for tc in d.get("tool_calls") or []:
-                if not isinstance(tc, dict):
-                    continue
-                slot = self.tools.setdefault(int(tc.get("index", 0)), {"id": None, "name": "", "args": []})
-                fn = tc.get("function") or {}
+            for tc in _dicts(d.get("tool_calls")):
+                index = tc.get("index")
+                slot = self.tools.setdefault(index if isinstance(index, int) else 0,
+                                             {"id": None, "name": "", "args": []})
+                fn = _dict_get(tc, "function")
                 if tc.get("id"):
                     slot["id"] = tc["id"]
                 if fn.get("name"):
@@ -1048,6 +1181,7 @@ class StreamTranslator:
                 if isinstance(fn.get("arguments"), str):
                     slot["args"].append(fn["arguments"])
             if choice.get("finish_reason"):
+                self.finish_seen = True
                 self.stop_reason = map_finish_reason(choice["finish_reason"])
         return ev
 
@@ -1077,6 +1211,11 @@ class StreamTranslator:
         return ev
 
 
+# ---------------------------------------------------------------------------
+# Request facts: token estimate, initiator, vision, context editing
+# ---------------------------------------------------------------------------
+
+
 def estimate_tokens(payload: dict[str, Any]) -> int:
     """Rough token count for /v1/messages/count_tokens (no tokenizer in the stdlib)."""
     chars = 0
@@ -1104,29 +1243,20 @@ def estimate_tokens(payload: dict[str, Any]) -> int:
 
 def openai_flags(payload: dict[str, Any]) -> tuple[bool, bool]:
     """(is_agent, is_vision) for Chat Completions `messages` or Responses `input` items."""
-    vision = False
     items = payload.get("messages")
     if not isinstance(items, list):
-        items = payload.get("input") if isinstance(payload.get("input"), list) else []
+        items = payload.get("input")
+    items = _dicts(items)
     # agent only when the request continues a tool loop: the last item is a tool result
-    last = items[-1] if items and isinstance(items[-1], dict) else {}
+    last = items[-1] if items else {}
     agent = last.get("role") == "tool" or str(last.get("type") or "").endswith("_call_output")
-    for m in items:
-        if not isinstance(m, dict):
-            continue
-        if isinstance(m.get("content"), list) and any(
-                isinstance(p, dict) and p.get("type") in ("input_image",) for p in m["content"]):
-            vision = True
-        if isinstance(m.get("content"), list):
-            vision = vision or any(isinstance(p, dict) and p.get("type") == "image_url" for p in m["content"])
+    vision = any(p.get("type") in ("image_url", "input_image") for m in items for p in _dicts(m.get("content")))
     return agent, vision
 
 
 def is_tool_continuation(msg: dict[str, Any]) -> bool:
     """A user message that returns tool results (Claude Code's own next step, not a new human prompt)."""
-    content = msg.get("content")
-    return msg.get("role") == "user" and isinstance(content, list) and any(
-        isinstance(b, dict) and b.get("type") == "tool_result" for b in content)
+    return msg.get("role") == "user" and any(b.get("type") == "tool_result" for b in _dicts(msg.get("content")))
 
 
 def anthropic_flags(payload: dict[str, Any]) -> tuple[bool, bool]:
@@ -1135,22 +1265,93 @@ def anthropic_flags(payload: dict[str, Any]) -> tuple[bool, bool]:
     is_agent is True only when the last message is a user turn that carries tool_result blocks, i.e. Claude Code
     continuing its own tool loop. A prompt the person typed (even deep in a conversation) stays "user", so
     Copilot bills it as the prompt it is."""
-    vision = False
-    msgs = [m for m in payload.get("messages", []) if isinstance(m, dict)]
-    agent = is_tool_continuation(msgs[-1]) if msgs else False
-    for m in msgs:
-        content = m.get("content")
-        if isinstance(content, list):
-            for b in content:
-                if not isinstance(b, dict):
-                    continue
-                if b.get("type") == "tool_result":
-                    inner = b.get("content")
-                    if isinstance(inner, list) and any(isinstance(i, dict) and i.get("type") == "image" for i in inner):
-                        vision = True
-                elif b.get("type") == "image":
-                    vision = True
+    msgs = _dicts(payload.get("messages"))
+    # the last turn of the conversation decides; a per-turn control message after it (role "system") does not
+    turns = [m for m in msgs if m.get("role") in ("user", "assistant")]
+    agent = bool(turns) and is_tool_continuation(turns[-1])
+
+    def has_image(blocks: Any) -> bool:
+        return any(b.get("type") == "image" for b in _dicts(blocks))
+
+    vision = any(has_image(m.get("content")) or any(has_image(b.get("content")) for b in _dicts(m.get("content"))
+                                                    if b.get("type") == "tool_result") for m in msgs)
     return agent, vision
+
+
+def clamp_output(body: dict[str, Any], limit: Optional[int]) -> None:
+    """Keep max_tokens inside the model's output limit, so the request is not rejected and sent again."""
+    if not limit or not isinstance(body.get("max_tokens"), int) or body["max_tokens"] <= limit:
+        return
+    body["max_tokens"] = limit
+    # Anthropic rejects thinking.budget_tokens >= max_tokens; keep the invariant after clamping
+    th = body.get("thinking")
+    if isinstance(th, dict) and isinstance(th.get("budget_tokens"), int) and th["budget_tokens"] >= limit:
+        if limit <= 2048:
+            del body["thinking"]  # no room for the 1,024-token minimum budget plus an answer
+        else:
+            body["thinking"] = {**th, "budget_tokens": limit - 1024}
+
+
+EFFORT_ORDER = ("low", "medium", "high", "xhigh", "max")
+
+
+def _fit_effort(config: Any, levels: list[str]) -> Any:
+    """An output_config with its effort fitted to the levels the model has: the nearest one not above the level
+    asked for, else the lowest; no effort for a model without any. The same object when nothing changes."""
+    asked = config.get("effort") if isinstance(config, dict) else None
+    if asked in levels or asked not in EFFORT_ORDER:
+        return config
+    fitted = {k: v for k, v in config.items() if k != "effort"}
+    usable = [x for x in EFFORT_ORDER if x in levels]
+    if usable:
+        below = [x for x in usable if EFFORT_ORDER.index(x) <= EFFORT_ORDER.index(asked)]
+        fitted["effort"] = below[-1] if below else usable[0]
+    return fitted
+
+
+def fit_to_model(body: dict[str, Any], supports: dict[str, Any]) -> bool:
+    """Fit a native request to what Copilot's model list says the model can do (`supports`). Claude Code sends
+    the settings of the model it was told it has, and the proxy may have mapped that to another one:
+    - adaptive thinking becomes a fixed thinking budget on a model without adaptive thinking;
+    - output_config.effort becomes a level the model has, or is removed on a model without reasoning effort.
+      The same for the per-turn setting, which Claude Code sends as a last message
+      {"role": "system", "content": [], "output_config": {...}}.
+    Without this Copilot answers 400 (measured: Claude Code 2.1.332, claude-haiku-4.5). Returns True when a
+    per-turn message was removed; the caller then drops the per-turn beta too. Nothing is changed when the
+    model's capabilities are not known."""
+    if not supports:
+        return False
+    th = body.get("thinking")
+    budget = supports.get("max_thinking_budget")
+    if isinstance(th, dict) and th.get("type") == "adaptive" and not supports.get("adaptive_thinking") \
+            and isinstance(budget, int) and isinstance(body.get("max_tokens"), int):
+        budget = min(budget, body["max_tokens"] - 1024)  # the same room for the answer as clamp_output leaves
+        if budget >= 1024:
+            body["thinking"] = {**th, "type": "enabled", "budget_tokens": budget}
+        else:
+            del body["thinking"]
+
+    levels = supports.get("reasoning_effort")
+    levels = [x for x in levels if isinstance(x, str)] if isinstance(levels, list) else []
+    fitted = _fit_effort(body.get("output_config"), levels)
+    if fitted is not body.get("output_config"):
+        if fitted:
+            body["output_config"] = fitted
+        else:
+            del body["output_config"]
+    removed = False
+    msgs = []
+    for m in body["messages"]:
+        fitted = _fit_effort(m.get("output_config"), levels)
+        if fitted is m.get("output_config"):
+            msgs.append(m)
+        elif fitted or m.get("content"):  # still says something: keep it, with the fitted setting or without one
+            msgs.append({**{k: v for k, v in m.items() if k != "output_config"},
+                         **({"output_config": fitted} if fitted else {})})
+        else:
+            removed = True
+    body["messages"] = msgs
+    return removed
 
 
 def context_management_for(body: dict[str, Any], mode: str) -> Optional[dict[str, Any]]:
@@ -1162,15 +1363,14 @@ def context_management_for(body: dict[str, Any], mode: str) -> Optional[dict[str
         return None
     edits: list[Any] = list(own["edits"]) if own else []
     types = {e.get("type") for e in edits if isinstance(e, dict) and isinstance(e.get("type"), str)}
-    msgs = body.get("messages") if isinstance(body.get("messages"), list) else []
     added = False
     th = body.get("thinking")
     if mode in ("thinking", "both") and isinstance(th, dict) and th.get("type") in ("enabled", "adaptive") \
             and "clear_thinking_20251015" not in types:
         edits.insert(0, {"type": "clear_thinking_20251015", "keep": {"type": "thinking_turns", "value": 1}})
         added = True
-    n_tool_uses = sum(1 for m in msgs if isinstance(m, dict) and isinstance(m.get("content"), list)
-                      for b in m["content"] if isinstance(b, dict) and b.get("type") == "tool_use")
+    n_tool_uses = sum(1 for m in _dicts(body.get("messages")) for b in _dicts(m.get("content"))
+                      if b.get("type") == "tool_use")
     # Copilot evaluates the trigger on the full history every request, so a fixed `keep` clears one more tool
     # result on every tool turn and the whole cached prefix is rewritten each time (measured). Clearing in steps
     # of CLEAR_STEP tool uses keeps the cleared set, and so the cached prefix, unchanged between steps.
@@ -1186,38 +1386,27 @@ def context_management_for(body: dict[str, Any], mode: str) -> Optional[dict[str
     return {**(own or {}), "edits": edits} if added else None
 
 
+def context_edit_refused(status: int, raw: bytes) -> bool:
+    low = raw[:2000].lower()
+    return status == 400 and any(s in low for s in (b"context_management", b"context management",
+                                                    b"context-management", b"clear_tool_uses", b"clear_thinking"))
+
+
 def cleared_input_tokens(ev: Any) -> Optional[int]:
     """Sum of `cleared_input_tokens` in a response or stream event's context_management.applied_edits."""
     if not isinstance(ev, dict):
         return None
     for holder in (ev, ev.get("delta"), ev.get("message")):
-        cm = _dict_get(holder, "context_management")
-        edits = cm.get("applied_edits")
+        edits = _dict_get(holder, "context_management").get("applied_edits")
         if isinstance(edits, list):
-            return sum(e.get("cleared_input_tokens") or 0 for e in edits
-                       if isinstance(e, dict) and isinstance(e.get("cleared_input_tokens"), int))
+            return sum(e["cleared_input_tokens"] for e in _dicts(edits)
+                       if isinstance(e.get("cleared_input_tokens"), int))
     return None
 
 
-class _Replay:
-    """An upstream response whose body was already read (status, headers and body kept)."""
-
-    def __init__(self, resp: http.client.HTTPResponse, raw: bytes):
-        self.status, self._resp, self._raw = resp.status, resp, raw
-
-    def read(self) -> bytes:
-        raw, self._raw = self._raw, b""
-        return raw
-
-    def getheader(self, name: str, default: Optional[str] = None) -> Optional[str]:
-        return self._resp.getheader(name, default)
-
-
-def _context_edit_refused(status: int, raw: bytes) -> bool:
-    low = raw[:2000].lower()
-    return status == 400 and (b"context_management" in low or b"context management" in low
-                              or b"context-management" in low
-                              or b"clear_tool_uses" in low or b"clear_thinking" in low)
+# ---------------------------------------------------------------------------
+# Usage log
+# ---------------------------------------------------------------------------
 
 
 class UsageLog:
@@ -1233,7 +1422,8 @@ class UsageLog:
                                        "cleared_input_tokens": 0, "by_route": {}, "by_model": {}}
 
     def record(self, **row: Any) -> None:
-        raw = row.get("usage") if isinstance(row.get("usage"), dict) else {}
+        raw = row.get("usage")
+        raw = raw if isinstance(raw, dict) else {}
         usage = {}
         for f in self.FIELDS:
             try:
@@ -1246,22 +1436,21 @@ class UsageLog:
             t["requests"] += 1
             if int(row.get("status") or 0) >= 400:
                 t["errors"] += 1
-            for f in self.FIELDS:
-                t[f] += int(usage.get(f) or 0)
             if isinstance(row.get("cleared_input_tokens"), int):
                 t["cleared_input_tokens"] += max(0, row["cleared_input_tokens"])
-            for key, name in (("by_route", row.get("route")), ("by_model", row.get("model"))):
-                if name:
-                    b = t[key].setdefault(name, {"requests": 0, **{f: 0 for f in self.FIELDS}})
-                    b["requests"] += 1
-                    for f in self.FIELDS:
-                        b[f] += int(usage.get(f) or 0)
+            buckets = [t] + [t[key].setdefault(name, {"requests": 0, **{f: 0 for f in self.FIELDS}})
+                             for key, name in (("by_route", row.get("route")), ("by_model", row.get("model"))) if name]
+            for bucket in buckets[1:]:
+                bucket["requests"] += 1
+            for bucket in buckets:
+                for f in self.FIELDS:
+                    bucket[f] += usage[f]
             if self.path:
                 try:
                     self.path.parent.mkdir(parents=True, exist_ok=True)
                     with self.path.open("a", encoding="utf-8") as fh:
                         fh.write(json.dumps(row, ensure_ascii=False) + "\n")
-                except OSError as exc:
+                except (OSError, UnicodeEncodeError) as exc:
                     LOG.warning("usage log write failed: %s", exc)
 
     def snapshot(self) -> dict[str, Any]:
@@ -1274,6 +1463,10 @@ class UsageLog:
         return t
 
 
+# ---------------------------------------------------------------------------
+# HTTP server
+# ---------------------------------------------------------------------------
+
 ERROR_TYPES = {400: "invalid_request_error", 401: "authentication_error", 403: "permission_error",
                404: "not_found_error", 413: "request_too_large", 429: "rate_limit_error", 529: "overloaded_error"}
 
@@ -1282,13 +1475,34 @@ def anthropic_error(status: int, message: str) -> dict[str, Any]:
     return {"type": "error", "error": {"type": ERROR_TYPES.get(status, "api_error"), "message": message}}
 
 
-# ---------------------------------------------------------------------------
-# HTTP server
-# ---------------------------------------------------------------------------
+class Reject(Exception):
+    """Ends the current request with this status and message. Raised where a check fails, answered in one place
+    (Handler._handle). close=True also ends the connection: the request body was not read."""
+
+    def __init__(self, status: int, message: str, headers: Optional[dict[str, str]] = None, close: bool = False):
+        super().__init__(message)
+        self.status, self.message, self.headers, self.close = status, message, headers, close
+
+
+def check_messages_request(payload: dict[str, Any]) -> None:
+    """The fields the proxy itself reads must have the right type; the rest is for Copilot to judge."""
+    msgs = payload.get("messages")
+    if not isinstance(msgs, list):
+        raise Reject(400, "messages: must be a list")
+    if not all(isinstance(m, dict) for m in msgs):
+        raise Reject(400, "messages: every item must be an object")
+    mt = payload.get("max_tokens")
+    if isinstance(mt, float) and mt.is_integer():
+        payload["max_tokens"] = mt = int(mt)
+    if mt is not None and (isinstance(mt, bool) or not isinstance(mt, int) or mt < 1):
+        raise Reject(400, "max_tokens: must be a positive integer")
 
 
 class _ProxyConfig:
     """Settings shared by the TCP and the Unix-socket server."""
+
+    daemon_threads = True
+    request_queue_size = 64  # Claude Code opens several connections at once
 
     def _setup(self, tm: TokenManager, catalog: ModelCatalog, guard: RequestGuard, show_token: bool,
                mode: str, count_mode: str, usage: Optional[UsageLog]) -> None:
@@ -1308,17 +1522,16 @@ class _ProxyConfig:
         self.is_unix = False
 
     def use_native(self, model: str) -> bool:
-        if self.mode == "translate":
-            return False
-        if self.mode == "native":
-            return True
-        self.catalog.ensure_loaded()
-        return self.catalog.supports_endpoint(model, "/v1/messages")
+        """Whether a /v1/messages request for this model goes to Copilot's own /v1/messages."""
+        return self.mode == "native" or (self.mode == "auto" and self.catalog.supports_endpoint(model, "/v1/messages"))
+
+    def count_native(self, model: str) -> bool:
+        return self.count_mode == "native" or (
+            self.count_mode == "auto" and self.catalog.supports_endpoint(model, "/v1/messages"))
 
 
 class ProxyServer(_ProxyConfig, ThreadingHTTPServer):
     allow_reuse_address = True
-    daemon_threads = True
 
     def __init__(self, addr: tuple[str, int], tm: TokenManager, catalog: ModelCatalog,
                  guard: RequestGuard, show_token: bool, mode: str = "auto", count_mode: str = "auto",
@@ -1327,6 +1540,8 @@ class ProxyServer(_ProxyConfig, ThreadingHTTPServer):
         self.allowed_hosts |= {h for h in [host_name(str(addr[0]))] if h}
         # binding to all interfaces is an explicit choice to accept any Host
         self.check_host = addr[0] not in ("0.0.0.0", "::", "")
+        if ":" in addr[0]:
+            self.address_family = socket.AF_INET6
         super().__init__(addr, Handler)
 
 
@@ -1334,10 +1549,9 @@ class ProxyServer(_ProxyConfig, ThreadingHTTPServer):
 _UnixBase = getattr(socketserver, "UnixStreamServer", socketserver.TCPServer)
 
 
-class UnixProxyServer(_ProxyConfig, socketserver.ThreadingMixIn, _UnixBase):
+class UnixProxyServer(_ProxyConfig, socketserver.ThreadingMixIn, _UnixBase):  # type: ignore[misc, valid-type]
     """Listens on a Unix socket only (Claude Code: ANTHROPIC_UNIX_SOCKET). The socket file is mode 0600, so only
     this user can connect, and there is no TCP port for other local processes or sandboxed commands."""
-    daemon_threads = True
 
     def __init__(self, path: str, tm: TokenManager, catalog: ModelCatalog, guard: RequestGuard,
                  show_token: bool, mode: str = "auto", count_mode: str = "auto",
@@ -1383,6 +1597,15 @@ class UnixProxyServer(_ProxyConfig, socketserver.ThreadingMixIn, _UnixBase):
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server: Any  # ProxyServer | UnixProxyServer
+    _streaming = False  # the SSE answer has started: a failure can only be sent as an event
+    _answered = False   # the whole answer is out: nothing more may be written for this request
+    _anthropic = True   # shape of an error body: Anthropic, or OpenAI on the OpenAI routes
+
+    def setup(self) -> None:
+        super().setup()
+        if self.connection.family in (socket.AF_INET, socket.AF_INET6):
+            # send every SSE event at once instead of holding it until the previous packet is acknowledged
+            self.connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 
     def address_string(self) -> str:
         ca = self.client_address
@@ -1391,7 +1614,77 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt: str, *args: Any) -> None:
         LOG.info("%s %s", self.address_string(), fmt % args)
 
-    # -- responses ---------------------------------------------------------
+    # -- one request -------------------------------------------------------
+
+    def do_GET(self) -> None:
+        self._handle(self._get)
+
+    def do_POST(self) -> None:
+        self._handle(self._post)
+
+    def do_OPTIONS(self) -> None:
+        self._handle(self._preflight)
+
+    def do_HEAD(self) -> None:
+        self.send_response(200)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def _handle(self, route: Callable[[], None]) -> None:
+        """Access checks, then the route. Whatever fails, the client gets an answer (an HTTP error, or an SSE
+        error event once a stream has started) and every connection to Copilot is closed or back in the pool."""
+        self._streaming, self._answered, self._anthropic = False, False, True
+        self._upstreams: list[UpstreamResponse] = []
+        try:
+            self._check_access()
+            route()
+        except Reject as exc:
+            self.close_connection = self.close_connection or exc.close
+            self._fail(exc.status, exc.message, exc.headers)
+        except ConnectionError as exc:  # the client or Copilot went away
+            LOG.info("Connection error: %s", exc)
+            self.close_connection = True
+            self._fail(502, f"Upstream connection error: {exc}")
+        except (OSError, http.client.HTTPException, UpstreamError) as exc:
+            LOG.warning("%s %s: %s: %s", self.command, self._path(), type(exc).__name__, exc)
+            self._fail(502, f"Upstream error: {exc}")
+        except Exception as exc:
+            LOG.exception("%s %s failed", self.command, self._path())
+            self._fail(500, f"Proxy error: {type(exc).__name__}: {exc}")
+        finally:
+            for up in self._upstreams:
+                up.close()
+
+    def _path(self) -> str:
+        return urllib.parse.urlsplit(self.path).path.rstrip("/") or "/"  # Claude Code adds ?beta=true
+
+    def _check_access(self) -> None:
+        """Block DNS rebinding (unexpected Host), cross-site browser requests (Origin not allowed) and, with
+        --auth-token, requests without the key."""
+        srv = self.server
+        host = self.headers.get("Host") or ""
+        origin = self.headers.get("Origin")
+        status, reason = 403, None
+        if srv.check_host and host_name(host) not in srv.allowed_hosts:
+            reason = f"Host '{host}' not allowed (use --allow-host)"
+        elif origin and not ("*" in srv.cors_origins or origin in srv.cors_origins):
+            reason = f"Origin '{origin}' not allowed (use --cors-origin)"
+        elif srv.auth_token and self._path() not in ("/", "/health") and self.command != "OPTIONS" \
+                and not self._key_ok():
+            status, reason = 401, "Missing or wrong proxy key (Authorization: Bearer <key> or x-api-key)"
+        if reason:
+            raise Reject(status, reason, {"Connection": "close"}, close=True)
+
+    def _key_ok(self) -> bool:
+        want = self.server.auth_token.encode()
+        auth = self.headers.get("Authorization") or ""
+        keys = [self.headers.get("x-api-key") or "", auth[7:].strip() if auth[:7].lower() == "bearer " else ""]
+        ok = False
+        for k in keys:  # no short-circuit: compare both in constant time
+            ok |= bool(k) and hmac.compare_digest(k.encode(), want)
+        return ok
+
+    # -- answers -----------------------------------------------------------
 
     def _cors(self) -> None:
         # No CORS by default: a browser page must not be able to spend the Copilot account.
@@ -1404,38 +1697,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Access-Control-Allow-Headers",
                              "Content-Type, Authorization, x-api-key, anthropic-version, anthropic-beta")
 
-    def _request_allowed(self) -> bool:
-        """Block DNS rebinding (unexpected Host) and cross-site browser requests (Origin not allowed)."""
-        raw = self.headers.get("Host") or ""
-        name = host_name(raw)
-        reason = None
-        if self.server.check_host and (name is None or name not in self.server.allowed_hosts):
-            reason = f"Host '{raw}' not allowed (use --allow-host)"
-        origin = self.headers.get("Origin")
-        allowed = self.server.cors_origins
-        if reason is None and origin and not ("*" in allowed or origin in allowed):
-            reason = f"Origin '{origin}' not allowed (use --cors-origin)"
-        status = 403
-        path = urllib.parse.urlsplit(self.path).path.rstrip("/") or "/"
-        if reason is None and self.server.auth_token and path not in ("/", "/health") \
-                and self.command != "OPTIONS" and not self._key_ok():
-            status, reason = 401, "Missing or wrong proxy key (Authorization: Bearer <key> or x-api-key)"
-        if reason is None:
-            return True
-        self.close_connection = True  # the request body is not read, so the connection cannot be reused
-        self._send_json(status, anthropic_error(status, reason), extra={"Connection": "close"})
-        return False
-
-    def _key_ok(self) -> bool:
-        want = self.server.auth_token.encode()
-        auth = self.headers.get("Authorization") or ""
-        keys = [self.headers.get("x-api-key") or "", auth[7:].strip() if auth[:7].lower() == "bearer " else ""]
-        ok = False
-        for k in keys:  # no short-circuit: compare both in constant time
-            ok |= bool(k) and hmac.compare_digest(k.encode(), want)
-        return ok
-
-    def _send_raw(self, status: int, body: bytes, ctype: str = "application/json; charset=utf-8",
+    def _send_raw(self, status: int, body: bytes, ctype: str = JSON_TYPE,
                   extra: Optional[dict[str, str]] = None) -> None:
         self.send_response(status)
         self._cors()
@@ -1446,14 +1708,10 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_header(k, v)
         self.end_headers()
         self.wfile.write(body)
+        self._answered = True
 
     def _send_json(self, status: int, body: Any, extra: Optional[dict[str, str]] = None) -> None:
-        self._send_raw(status, json.dumps(body, ensure_ascii=False).encode("utf-8"), extra=extra)
-
-    @staticmethod
-    def _passthrough_headers(resp: http.client.HTTPResponse) -> dict[str, str]:
-        """Upstream headers worth keeping on errors: Claude Code backs off on retry-after."""
-        return {k: resp.getheader(k) or "" for k in ("retry-after", "x-request-id", "request-id")}
+        self._send_raw(status, _dumps(body), extra=extra)
 
     def _begin_sse(self) -> None:
         self.send_response(200)
@@ -1466,485 +1724,394 @@ class Handler(BaseHTTPRequestHandler):
 
     def _chunk(self, data: bytes) -> None:
         if data:
-            self.wfile.write(f"{len(data):x}\r\n".encode() + data + b"\r\n")
-            self.wfile.flush()
+            self.wfile.write(b"%x\r\n%s\r\n" % (len(data), data))
 
     def _end_chunks(self) -> None:
         self.wfile.write(b"0\r\n\r\n")
-        self.wfile.flush()
+        self._answered = True
 
-    def _fail(self, status: int, message: str, anthropic: bool = True,
-              extra: Optional[dict[str, str]] = None) -> None:
-        """Error before headers -> normal response; after the stream started -> SSE error event."""
-        if getattr(self, "_streaming", False):
-            try:
-                self._chunk(sse("error", anthropic_error(status, message)) if anthropic
-                            else f"data: {json.dumps({'error': {'message': message}})}\n\n".encode())
-                self._end_chunks()
-            except OSError:
-                pass
+    def _fail(self, status: int, message: str, headers: Optional[dict[str, str]] = None) -> None:
+        """Before the answer started: an HTTP error. After an SSE stream started: an error event."""
+        if self._answered:  # a failure after the answer was complete: only make sure nothing follows it
+            self.close_connection = True
             return
-        body = anthropic_error(status, message) if anthropic else {"error": {"message": message}}
+        if self._anthropic:
+            body = anthropic_error(status, message)
+        else:
+            body = {"error": {"message": message, "type": ERROR_TYPES.get(status, "api_error")}}
         try:
-            self._send_json(status, body, extra=extra)
+            if self._streaming:
+                self._chunk(sse("error", body) if self._anthropic else b"data: " + _dumps(body) + b"\n\n")
+                self._end_chunks()
+            else:
+                self._send_json(status, body, headers)
         except OSError:
-            pass
+            self.close_connection = True  # the client is gone
 
-    def _read_body(self, anthropic: bool = True) -> Optional[bytes]:
-        """Content-Length or chunked body, at most MAX_BODY bytes; None after sending an error."""
-        te = [t.strip().lower() for h in (self.headers.get_all("Transfer-Encoding") or []) for t in h.split(",")]
-        if te and te[-1] == "chunked":
-            parts, total = [], 0
-            while True:
-                line = self.rfile.readline(1024)
-                try:
-                    if not line.endswith(b"\n"):
-                        raise ValueError("chunk-size line too long or truncated")
-                    field = line.split(b";")[0].strip()
-                    if not field or not all(ch in b"0123456789abcdefABCDEF" for ch in field):
-                        raise ValueError("bad chunk size")
-                    size = int(field, 16)
-                except ValueError:
-                    self.close_connection = True
-                    self._fail(400, "Malformed chunked body", anthropic)
-                    return None
-                if size == 0:
-                    for _ in range(64):  # trailers, bounded
-                        if self.rfile.readline(1024) in (b"\r\n", b"\n", b""):
-                            break
-                    else:
-                        self.close_connection = True  # unread trailers: do not reuse the connection
-                    return b"".join(parts)
-                total += size
-                if total > MAX_BODY:
-                    self.close_connection = True
-                    self._fail(413, f"Request body over {MAX_BODY} bytes", anthropic)
-                    return None
-                data = self.rfile.read(size)
-                if len(data) != size or self.rfile.readline(8) not in (b"\r\n", b"\n"):
-                    self.close_connection = True
-                    self._fail(400, "Truncated chunked body", anthropic)
-                    return None
-                parts.append(data)
-        if te:  # a transfer coding other than chunked last: cannot frame the body
-            self.close_connection = True
-            self._fail(400, "Unsupported Transfer-Encoding", anthropic)
-            return None
-        values = {v.strip() for v in (self.headers.get_all("Content-Length") or [])}
-        n = int(next(iter(values))) if len(values) == 1 and next(iter(values)).isdigit() else (0 if not values else -1)
-        if n < 0 or n > MAX_BODY:
-            self.close_connection = True
-            self._fail(413 if n > MAX_BODY else 400, f"Bad or too large Content-Length (max {MAX_BODY})", anthropic)
-            return None
-        raw = self.rfile.read(n) if n > 0 else b""
-        if len(raw) != n:
-            self.close_connection = True
-            self._fail(400, "Truncated request body", anthropic)
-            return None
-        return raw
+    def _relay(self, up: UpstreamResponse, on_data: Callable[[dict[str, Any]], None],
+               marks: tuple[bytes, ...] = (b'"usage"',)) -> None:
+        """Forward Copilot's SSE stream unchanged, in the pieces it arrives in. `on_data` gets the JSON of every
+        `data:` line that contains one of `marks` (the lines with the token counts)."""
+        def scan(lines: list[bytes]) -> None:
+            for line in lines:
+                if line.startswith(b"data:") and any(m in line for m in marks):
+                    on_data(_json_object(line[5:]))
 
-    def _read_json(self, anthropic: bool = True) -> Optional[dict[str, Any]]:
-        raw = self._read_body(anthropic)
-        if raw is None:
-            return None
+        self._begin_sse()
+        tail = b""
+        for block in up.blocks():
+            self._chunk(block)
+            *lines, tail = (tail + block).split(b"\n")
+            scan(lines)
+        scan([tail])
+        self._end_chunks()
+
+    # -- request -----------------------------------------------------------
+
+    def _read_body(self) -> bytes:
+        """The request body (Content-Length or chunked), at most MAX_BODY bytes. A body that cannot be framed
+        also ends the connection, because the next request could not be found in it."""
+        def bad(status: int, message: str) -> Reject:
+            return Reject(status, message, close=True)
+
+        codings = [t.strip().lower() for h in (self.headers.get_all("Transfer-Encoding") or []) for t in h.split(",")]
+        if codings and codings[-1] != "chunked":
+            raise bad(400, "Unsupported Transfer-Encoding")
+        if not codings:
+            lengths = {v.strip() for v in (self.headers.get_all("Content-Length") or [])}
+            if not lengths:
+                return b""
+            value = lengths.pop()
+            if lengths or not (value.isascii() and value.isdigit()):  # two different values, or not a number
+                raise bad(400, "Bad Content-Length")
+            if int(value) > MAX_BODY:
+                raise bad(413, f"Request body over {MAX_BODY} bytes")
+            raw = self.rfile.read(int(value))
+            if len(raw) != int(value):
+                raise bad(400, "Truncated request body")
+            return raw
+        parts, total = [], 0
+        while True:
+            line = self.rfile.readline(1024)
+            field = line.split(b";")[0].strip()  # the chunk size in hex; chunk extensions are ignored
+            if not line.endswith(b"\n") or not field or not all(c in b"0123456789abcdefABCDEF" for c in field):
+                raise bad(400, "Malformed chunked body")
+            size = int(field, 16)
+            if size == 0:
+                break
+            total += size
+            if total > MAX_BODY:
+                raise bad(413, f"Request body over {MAX_BODY} bytes")
+            data = self.rfile.read(size)
+            if len(data) != size or self.rfile.readline(8) not in (b"\r\n", b"\n"):
+                raise bad(400, "Truncated chunked body")
+            parts.append(data)
+        for _ in range(64):  # trailers, bounded
+            if self.rfile.readline(1024) in (b"\r\n", b"\n", b""):
+                break
+        else:
+            self.close_connection = True  # unread trailers: do not reuse the connection
+        return b"".join(parts)
+
+    def _read_json(self) -> dict[str, Any]:
+        raw = self._read_body()
         try:
-            body = json.loads(raw.decode("utf-8")) if raw else {}
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            self._fail(400, f"Invalid JSON body: {exc}", anthropic)
-            return None
+            body = json.loads(raw) if raw else {}
+        except (ValueError, RecursionError) as exc:
+            raise Reject(400, f"Invalid JSON body: {exc}") from None
         if not isinstance(body, dict):
-            self._fail(400, "JSON body must be an object", anthropic)
-            return None
+            raise Reject(400, "JSON body must be an object")
         return body
 
-    def _copilot(self, path: str, payload: dict[str, Any], agent: bool, vision: bool,
-                 extra_headers: Optional[dict[str, str]] = None):
+    def _guard(self, summary: str) -> None:
+        ok, wait = self.server.guard.check(summary)
+        if not ok and wait is None:
+            raise Reject(403, "Request rejected by manual approval.")
+        if not ok:
+            raise Reject(429, f"Local rate limit. Retry after {wait:.1f}s.",
+                         {"Retry-After": str(max(1, math.ceil(wait)))})
+
+    # -- Copilot -----------------------------------------------------------
+
+    def _copilot(self, path: str, payload: dict[str, Any], agent: bool = False, vision: bool = False,
+                 extra_headers: Optional[dict[str, str]] = None) -> UpstreamResponse:
         """POST to Copilot. Retries once on 401 (token refresh) and up to RETRIES times on 429/5xx, before any
         byte reaches the client, so Claude Code does not re-send the whole prompt after a long backoff."""
-        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        body = _dumps(payload)
         refreshed = force = False
         retries = 0
         while True:
             token, base = self.server.tm.get_token(force_refresh=force)
             force = False
-            headers = self.server.tm.copilot_headers(token, agent, vision)
-            if extra_headers:
-                headers.update(extra_headers)
-            conn, resp = open_upstream(base, path, "POST", headers, body)
-            if resp.status == 401 and not refreshed:
-                resp.read()
-                conn.close()
+            headers = {**self.server.tm.copilot_headers(token, agent, vision), **(extra_headers or {})}
+            up = UPSTREAM.post(base, path, headers, body)
+            self._upstreams.append(up)
+            wait = None
+            if up.status == 401 and not refreshed:
                 refreshed = force = True
+                wait = 0.0
                 LOG.warning("Copilot 401; refreshing token and retrying")
-                continue
-            if resp.status in RETRY_STATUSES and retries < RETRIES:
-                wait = _retry_after(resp.getheader("Retry-After"), retries)
+            elif up.status in RETRY_STATUSES and retries < RETRIES:
+                wait = _retry_after(up.header("Retry-After"), retries)
                 if wait is not None:
-                    resp.read()
-                    conn.close()
                     retries += 1
-                    LOG.warning("Copilot %d; retry %d in %.1fs", resp.status, retries, wait)
-                    time.sleep(wait)
-                    continue
-            return conn, resp
+                    LOG.warning("Copilot %d; retry %d in %.1fs", up.status, retries, wait)
+            if wait is None:
+                return up
+            up.body()  # read to the end, so the connection can be used again
+            time.sleep(wait)
 
-    def _guard(self, summary: str, anthropic: bool) -> bool:
-        ok, retry = self.server.guard.check(summary)
-        if ok:
-            return True
-        if retry is not None:
-            self._fail(429, f"Local rate limit. Retry after {retry:.1f}s.", anthropic,
-                       extra={"Retry-After": str(max(1, int(retry + 0.999)))})
-        else:
-            self._fail(403, "Request rejected by manual approval.", anthropic)
-        return False
+    def _native_headers(self, without_per_turn: bool = False) -> dict[str, str]:
+        """The client's Anthropic version and betas for Copilot's Anthropic endpoints."""
+        h = {"anthropic-version": self.headers.get("anthropic-version") or "2023-06-01"}
+        betas = [b.strip() for value in self.headers.get_all("anthropic-beta") or [] for b in value.split(",")]
+        if without_per_turn:  # fit_to_model removed the per-turn message: its beta goes with it
+            betas = [b for b in betas if not b.startswith("per-turn-control")]
+        betas = [b for b in betas if b]
+        if betas and os.environ.get("COPILOT_PROXY_DROP_BETA") != "1":
+            h["anthropic-beta"] = ",".join(betas)
+        return h
 
-    # -- verbs ---------------------------------------------------------------
+    @staticmethod
+    def _passthrough_headers(up: UpstreamResponse) -> dict[str, str]:
+        """Upstream headers worth keeping on errors: Claude Code backs off on retry-after."""
+        return {k: up.header(k) for k in ("retry-after", "x-request-id", "request-id")}
 
-    def do_OPTIONS(self) -> None:
-        self._streaming = False
-        if not self._request_allowed():
-            return
+    def _record(self, log: dict[str, Any], started: float, status: int, usage: Any = None) -> None:
+        self.server.usage.record(**log, status=status, usage=usage, ms=int((time.monotonic() - started) * 1000))
+
+    # -- routes ------------------------------------------------------------
+
+    def _preflight(self) -> None:
         self.send_response(204)
         self._cors()
         self.send_header("Content-Length", "0")
         self.end_headers()
 
-    def do_HEAD(self) -> None:
-        self.send_response(200)
-        self.send_header("Content-Length", "0")
-        self.end_headers()
-
-    def do_GET(self) -> None:
-        self._streaming = False
-        if not self._request_allowed():
-            return
-        path = urllib.parse.urlsplit(self.path).path.rstrip("/") or "/"
+    def _get(self) -> None:
+        srv, path = self.server, self._path()
         if path in ("/", "/health"):
             self._send_json(200, {"status": "ok", "service": "copilot-proxy-stdlib",
-                                  "api_base_url": self.server.tm.api_base_url})
+                                  "api_base_url": srv.tm.api_base_url})
         elif path in ("/models", "/v1/models"):
-            self._send_json(200, self.server.catalog.get_models_payload())
+            self._send_json(200, srv.catalog.get_models_payload())
         elif path == "/usage":
-            status, data = self.server.tm.fetch_usage()
-            self._send_json(status, data)
+            status, data = srv.tm.fetch_usage()
+            self._send_json(status or 502, data)
         elif path == "/stats":
-            self._send_json(200, self.server.usage.snapshot())
+            self._send_json(200, srv.usage.snapshot())
         elif path == "/token":
-            if not self.server.show_token:
-                self._send_json(403, {"error": "Disabled. Start with --show-token to enable."})
-                return
-            token, base = self.server.tm.get_token()
+            if not srv.show_token:
+                raise Reject(403, "Disabled. Start with --show-token to enable.")
+            token, base = srv.tm.get_token()
             self._send_json(200, {"token": token, "api_base_url": base})
         else:
-            self._send_json(404, anthropic_error(404, f"Not found: {path}"))
+            raise Reject(404, f"Not found: {path}")
 
-    def do_POST(self) -> None:
-        self._streaming = False
-        if not self._request_allowed():
-            self.close_connection = True  # body not read; do not reuse this connection
-            return
-        path = urllib.parse.urlsplit(self.path).path.rstrip("/")  # Claude Code adds ?beta=true
-        if path in ("/v1/messages", "/messages"):
+    def _post(self) -> None:
+        path = self._path()
+        route = path[3:] if path.startswith("/v1/") else path
+        if route == "/messages":
             self._messages()
-        elif path in ("/v1/messages/count_tokens", "/messages/count_tokens"):
+        elif route == "/messages/count_tokens":
             self._count_tokens()
-        elif path in ("/v1/chat/completions", "/chat/completions"):
-            self._openai_route("/chat/completions")
-        elif path in ("/v1/responses", "/responses"):
-            self._openai_route("/responses")
-        elif path in ("/v1/embeddings", "/embeddings"):
-            self._passthrough("/embeddings")
+        elif route in ("/chat/completions", "/responses"):
+            self._openai_route(route)
+        elif route == "/embeddings":
+            self._embeddings()
         else:
-            if self._read_body() is None:
-                return
-            self._send_json(404, anthropic_error(404, f"Not found: {path}"))
-
-    # -- endpoints -------------------------------------------------------------
+            self._read_body()  # so the connection can be used again
+            raise Reject(404, f"Not found: {path}")
 
     def _messages(self) -> None:
         payload = self._read_json()
-        if payload is None:
-            return
-        if not isinstance(payload.get("messages"), list):
-            self._fail(400, "messages: must be a list")
-            return
-        if not all(isinstance(m, dict) for m in payload["messages"]):
-            self._fail(400, "messages: every item must be an object")
-            return
-        requested = str(payload.get("model", ""))
-        cat = self.server.catalog
-        model = cat.resolve_model(requested)
+        check_messages_request(payload)
+        requested = str(payload.get("model") or "")
+        model = self.server.catalog.resolve_model(requested)
         stream = bool(payload.get("stream"))
-        if not self._guard(f"POST /v1/messages model={model} stream={stream}", True):
-            return
-        if self.server.use_native(model) and self._messages_native(payload, requested, model, stream):
-            return
-        t0 = time.time()
-        try:
-            oai, agent, vision = anthropic_to_openai_request(payload, model, cat.max_output_tokens(model))
-        except (ValueError, TypeError, AttributeError) as exc:
-            self._fail(400, f"Invalid request: {exc}")
-            return
-        LOG.info("messages: %s -> %s stream=%s initiator=%s vision=%s msgs=%d tools=%d", requested, model,
-                 stream, "agent" if agent else "user", vision, len(oai["messages"]), len(oai.get("tools", [])))
-        conn = None
-        try:
-            conn, resp = self._copilot("/chat/completions", oai, agent, vision)
-            log = dict(route="translate", model=model, stream=stream, initiator="agent" if agent else "user")
-            if resp.status != 200:
-                err = resp.read().decode("utf-8", errors="replace")
-                LOG.warning("Copilot error %d: %s", resp.status, err[:500])
-                self.server.usage.record(**log, status=resp.status, ms=int((time.time() - t0) * 1000))
-                self._fail(resp.status, err, extra=self._passthrough_headers(resp))
-                return
-            if not stream:
-                data = json.loads(resp.read().decode("utf-8", errors="replace"))
-                out = openai_to_anthropic_response(data, requested or model)
-                self.server.usage.record(**log, status=200, usage=out["usage"], ms=int((time.time() - t0) * 1000))
-                self._send_json(200, out)
-                return
-            tr = StreamTranslator(requested or model)
-            self._begin_sse()
-            while True:
-                line = resp.readline()
-                if not line:
-                    break
-                line = line.decode("utf-8", errors="replace").strip()
-                if not line.startswith("data:"):
-                    continue
-                data_str = line[5:].strip()
-                if data_str == "[DONE]":
-                    break
-                try:
-                    chunk = json.loads(data_str)
-                except json.JSONDecodeError:
-                    continue
-                for ev in tr.feed(chunk):
-                    self._chunk(ev)
-            for ev in tr.finalize():
-                self._chunk(ev)
-            self._end_chunks()
-            self.server.usage.record(**log, status=200, usage=dict(tr.usage), ms=int((time.time() - t0) * 1000))
-        except (BrokenPipeError, ConnectionResetError) as exc:
-            self._conn_error(exc)
-        except Exception as exc:
-            LOG.exception("/v1/messages failed")
-            self._fail(502, f"Upstream proxy error: {exc}")
-        finally:
-            if conn is not None:
-                conn.close()
-
-    def _conn_error(self, exc: Exception) -> None:
-        """A socket error on either side. Never reuse the connection; if nothing was sent yet the client
-        still gets a 502 (the write fails quietly if it was the client that went away)."""
-        self.close_connection = True
-        LOG.info("Connection error: %s", exc)
-        if not getattr(self, "_streaming", False):
-            self._fail(502, f"Upstream connection error: {exc}")
-
-    def _native_headers(self) -> dict[str, str]:
-        h = {"anthropic-version": self.headers.get("anthropic-version") or "2023-06-01"}
-        betas = self.headers.get_all("anthropic-beta") or []
-        if betas and os.environ.get("COPILOT_PROXY_DROP_BETA") != "1":
-            h["anthropic-beta"] = ",".join(b.strip() for b in betas)
-        return h
+        self._guard(f"POST /v1/messages model={model} stream={stream}")
+        if not (self.server.use_native(model) and self._messages_native(payload, requested, model, stream)):
+            self._messages_translated(payload, requested, model, stream)
 
     def _messages_native(self, payload: dict[str, Any], requested: str, model: str, stream: bool) -> bool:
-        """Forward the Anthropic request unchanged (model id mapped, max_tokens clamped) to Copilot's own
-        /v1/messages. Keeps cache_control breakpoints, thinking blocks and signatures intact.
-        Returns False (nothing sent to the client) when Copilot rejects the request shape in auto mode,
-        so the caller can fall back to the translated route."""
-        t0 = time.time()
-        body = dict(payload)
-        body["model"] = model
-        limit = self.server.catalog.max_output_tokens(model)
-        if limit and isinstance(body.get("max_tokens"), int) and body["max_tokens"] > limit:
-            body["max_tokens"] = limit
-            # Anthropic rejects thinking.budget_tokens >= max_tokens; keep the invariant after clamping
-            th = body.get("thinking")
-            if isinstance(th, dict) and isinstance(th.get("budget_tokens"), int) and th["budget_tokens"] >= limit:
-                if limit <= 2048:
-                    body.pop("thinking")  # no room for the 1,024-token minimum budget plus an answer
-                else:
-                    body["thinking"] = {**th, "budget_tokens": limit - 1024}
+        """Forward the Anthropic request unchanged (model id mapped, max_tokens and effort fitted to the model)
+        to Copilot's own /v1/messages. Keeps cache_control breakpoints, thinking blocks and signatures intact.
+        Returns False (nothing sent to the client) when Copilot refuses the route itself in auto mode, so the
+        caller can fall back to the translated route."""
+        started = time.monotonic()
+        srv = self.server
+        body = {**payload, "model": model}
+        clamp_output(body, srv.catalog.max_output_tokens(model))
         agent, vision = anthropic_flags(body)
+        client_headers = self._native_headers(without_per_turn=fit_to_model(body, srv.catalog.supports(model)))
         LOG.info("messages(native): %s -> %s stream=%s initiator=%s vision=%s msgs=%d tools=%d", requested, model,
-                 stream, "agent" if agent else "user", vision, len(body.get("messages", [])),
-                 len(body.get("tools") or []))
+                 stream, "agent" if agent else "user", vision, len(body["messages"]), len(body.get("tools") or []))
         log = dict(route="native", model=model, stream=stream, initiator="agent" if agent else "user")
-        headers = self._native_headers()
-        if "context_management" in body:
-            LOG.debug("client context_management: %s", json.dumps(body["context_management"])[:500])
+        headers = dict(client_headers)
         own_cm = body.get("context_management")
-        cm = None if model in self.server.no_context_edit else context_management_for(body, self.server.context_edit)
+        if own_cm is not None:
+            LOG.debug("client context_management: %s", json.dumps(own_cm)[:500])
+        cm = None if model in srv.no_context_edit else context_management_for(body, srv.context_edit)
         if cm:
             body["context_management"] = cm
-            betas = [b.strip() for b in headers.get("anthropic-beta", "").split(",") if b.strip()]
+            betas = [b for b in headers.get("anthropic-beta", "").split(",") if b]
             if CONTEXT_MANAGEMENT_BETA not in betas:
                 headers["anthropic-beta"] = ",".join(betas + [CONTEXT_MANAGEMENT_BETA])
-            log["context_edit"] = self.server.context_edit
-        conn = None
-        try:
-            conn, resp = self._copilot("/v1/messages", body, agent, vision, headers)
-            if cm and resp.status == 400:
-                raw = resp.read()
-                if not _context_edit_refused(resp.status, raw):
-                    resp = _Replay(resp, raw)
-                else:
-                    # send the client's own request once more, as it would have gone without the proxy's edit;
-                    # stop adding the edit for this model only when Copilot says the strategy is unsupported
-                    # (the same recovery Claude Code uses)
-                    LOG.warning("Copilot rejected the added context_management for %s (%s); resending without it",
-                                model, raw[:200])
-                    if any(s in raw.lower() for s in (b"does not support", b"not supported", b"unsupported")):
-                        self.server.no_context_edit.add(model)
-                    conn.close()
-                    if own_cm is None:
-                        body.pop("context_management", None)
-                    else:
-                        body["context_management"] = own_cm
-                    log["context_edit"] = "rejected"
-                    conn, resp = self._copilot("/v1/messages", body, agent, vision, self._native_headers())
-            if resp.status != 200 or not stream:
-                raw = resp.read()
-                parsed = _json_or_none(raw)
-                usage = _dict_get(parsed, "usage")
-                cleared = cleared_input_tokens(parsed)
-                if cleared:
-                    log["cleared_input_tokens"] = cleared
-                if resp.status != 200:
-                    LOG.warning("Copilot native error %d: %s", resp.status, raw[:500])
-                if self.server.mode == "auto" and _route_unsupported(resp.status, raw):
+            log["context_edit"] = srv.context_edit
+        up = self._copilot("/v1/messages", body, agent, vision, headers)
+        if cm and up.status == 400 and context_edit_refused(up.status, up.body()):
+            # send the client's own request once more, as it would have gone without the proxy's edit; stop
+            # adding the edit for this model only when Copilot says the strategy is unsupported (the same
+            # recovery Claude Code uses)
+            refusal = up.body()
+            LOG.warning("Copilot rejected the added context_management for %s (%s); resending without it",
+                        model, refusal[:200])
+            if any(s in refusal.lower() for s in (b"does not support", b"not supported", b"unsupported")):
+                srv.no_context_edit.add(model)
+            if own_cm is None:
+                del body["context_management"]
+            else:
+                body["context_management"] = own_cm
+            log["context_edit"] = "rejected"
+            up = self._copilot("/v1/messages", body, agent, vision, client_headers)
+
+        if up.status != 200 or not stream:
+            raw = up.body()
+            if up.status != 200:
+                LOG.warning("Copilot native error %d: %s", up.status, raw[:500])
+                if srv.mode == "auto" and _route_unsupported(up.status, raw):
                     # only when the endpoint/model itself is refused; a real 400 (context too long, bad
                     # request) goes back to Claude Code instead of re-sending the whole prompt elsewhere
-                    LOG.warning("Native route not available (%d); falling back to the translated route", resp.status)
+                    LOG.warning("Native route not available (%d); falling back to the translated route", up.status)
                     return False
-                self.server.usage.record(**log, status=resp.status, usage=usage, ms=int((time.time() - t0) * 1000))
-                self._send_raw(resp.status, raw, resp.getheader("Content-Type", "application/json; charset=utf-8"),
-                               extra=self._passthrough_headers(resp) if resp.status != 200 else None)
-                return True
-            self._begin_sse()
-            usage = {}
-            while True:
-                line = resp.readline()
-                if not line:
-                    break
-                self._chunk(line)
-                if line.startswith(b"data:") and b'"context_management"' in line:
-                    cleared = cleared_input_tokens(_json_or_none(line[5:].strip()))
-                    if cleared:
-                        log["cleared_input_tokens"] = cleared
-                if line.startswith(b"data:") and b'"usage"' in line:
-                    ev = _json_or_none(line[5:].strip())
-                    if ev.get("type") == "message_start":
-                        ev = _dict_get(ev, "message")
-                    usage.update({k: v for k, v in _dict_get(ev, "usage").items() if isinstance(v, int) and v})
-            self._end_chunks()
-            self.server.usage.record(**log, status=200, usage=usage, ms=int((time.time() - t0) * 1000))
-        except (BrokenPipeError, ConnectionResetError) as exc:
-            self._conn_error(exc)
-        except Exception as exc:
-            LOG.exception("/v1/messages (native) failed")
-            self._fail(502, f"Upstream proxy error: {exc}")
-        finally:
-            if conn is not None:
-                conn.close()
+            answer = _json_object(raw)
+            if cleared_input_tokens(answer):
+                log["cleared_input_tokens"] = cleared_input_tokens(answer)
+            self._record(log, started, up.status, _dict_get(answer, "usage"))
+            self._send_raw(up.status, raw, up.header("Content-Type", JSON_TYPE),
+                           self._passthrough_headers(up) if up.status != 200 else None)
+            return True
+
+        usage: dict[str, int] = {}
+
+        def scan(ev: dict[str, Any]) -> None:
+            if cleared_input_tokens(ev):
+                log["cleared_input_tokens"] = cleared_input_tokens(ev)
+            holder = _dict_get(ev, "message") if ev.get("type") == "message_start" else ev
+            usage.update({k: v for k, v in _dict_get(holder, "usage").items() if isinstance(v, int) and v})
+
+        self._relay(up, scan, (b'"usage"', b'"context_management"'))
+        self._record(log, started, 200, usage)
         return True
+
+    def _messages_translated(self, payload: dict[str, Any], requested: str, model: str, stream: bool) -> None:
+        """Send the request as /chat/completions and translate the answer back, streamed or whole."""
+        started = time.monotonic()
+        try:
+            oai, agent, vision = anthropic_to_openai_request(
+                payload, model, self.server.catalog.max_output_tokens(model))
+        except (ValueError, TypeError, AttributeError) as exc:
+            raise Reject(400, f"Invalid request: {exc}") from None
+        LOG.info("messages: %s -> %s stream=%s initiator=%s vision=%s msgs=%d tools=%d", requested, model,
+                 stream, "agent" if agent else "user", vision, len(oai["messages"]), len(oai.get("tools", [])))
+        log = dict(route="translate", model=model, stream=stream, initiator="agent" if agent else "user")
+        up = self._copilot("/chat/completions", oai, agent, vision)
+        if up.status != 200:
+            err = up.body().decode("utf-8", errors="replace")
+            LOG.warning("Copilot error %d: %s", up.status, err[:500])
+            self._record(log, started, up.status)
+            raise Reject(up.status, err, self._passthrough_headers(up))
+        if not stream:
+            try:
+                out = openai_to_anthropic_response(json.loads(up.body()), requested or model)
+            except (ValueError, TypeError, AttributeError) as exc:
+                raise UpstreamError(f"Copilot's answer could not be read: {exc}") from None
+            self._record(log, started, 200, out["usage"])
+            self._send_json(200, out)
+            return
+
+        tr = StreamTranslator(requested or model)
+        self._begin_sse()
+        done = False
+        for line in up.lines():  # read to the end even after [DONE], so the connection can be used again
+            if done or not line.startswith(b"data:"):
+                continue
+            data = line[5:].strip()
+            if data == b"[DONE]":
+                done = True
+                continue
+            chunk = _json_object(data)
+            if chunk.get("error"):
+                error = chunk["error"]
+                raise UpstreamError("Copilot error in the stream: "
+                                    + str(error.get("message") if isinstance(error, dict) else error))
+            self._chunk(b"".join(tr.feed(chunk)))
+        if not (done or tr.finish_seen):
+            raise UpstreamError("Copilot closed the stream before the answer was complete")
+        self._chunk(b"".join(tr.finalize()))
+        self._end_chunks()
+        self._record(log, started, 200, dict(tr.usage))
 
     def _count_tokens(self) -> None:
         payload = self._read_json()
-        if payload is None:
-            return
-        mode = self.server.count_mode
-        model = self.server.catalog.resolve_model(str(payload.get("model", "")))
-        if mode == "native" or (mode == "auto" and self.server.catalog.supports_endpoint(model, "/v1/messages")):
-            body = {k: v for k, v in payload.items() if k in ("model", "system", "messages", "tools", "tool_choice",
-                                                               "thinking")}
+        check_messages_request(payload)
+        model = self.server.catalog.resolve_model(str(payload.get("model") or ""))
+        if self.server.count_native(model):
+            body = {k: payload[k] for k in ("system", "messages", "tools", "tool_choice", "thinking") if k in payload}
             body["model"] = model
-            conn = None
             try:
-                vision = anthropic_flags(body)[1] if isinstance(body.get("messages"), list) else False
-                conn, resp = self._copilot("/v1/messages/count_tokens", body, False, vision, self._native_headers())
-                raw = resp.read()
-                if resp.status == 200:
-                    data = json.loads(raw)
-                    if isinstance(data.get("input_tokens"), int):
-                        self._send_json(200, {"input_tokens": data["input_tokens"]})
-                        return
-                LOG.warning("native count_tokens failed (%s); using the estimate", resp.status)
-            except Exception as exc:
+                up = self._copilot("/v1/messages/count_tokens", body, False, anthropic_flags(body)[1],
+                                   self._native_headers())
+                count = _json_object(up.body()).get("input_tokens")
+                if up.status == 200 and isinstance(count, int):
+                    self._send_json(200, {"input_tokens": count})
+                    return
+                LOG.warning("native count_tokens failed (%s); using the estimate", up.status)
+            except (OSError, http.client.HTTPException, UpstreamError) as exc:
                 LOG.warning("native count_tokens error: %s; using the estimate", exc)
-            finally:
-                if conn is not None:
-                    conn.close()
         self._send_json(200, {"input_tokens": estimate_tokens(payload)})
 
     def _openai_route(self, upstream: str) -> None:
         """OpenAI-format pass-through (/chat/completions, /responses), streaming kept byte for byte."""
-        payload = self._read_json(anthropic=False)
-        if payload is None:
-            return
+        self._anthropic = False
+        payload = self._read_json()
+        cat = self.server.catalog
         if payload.get("model"):
-            cat = self.server.catalog
-            if cat.only and not cat.family_id(str(payload["model"])):
-                self._fail(400, f"model {payload['model']}: only {', '.join(cat.only.values())} are enabled "
-                                "(start the proxy with --any-model for the full Copilot catalog)")
-                return
-            payload["model"] = cat.resolve_model(str(payload["model"]))
+            name = str(payload["model"])
+            if cat.only and not cat.family_id(name):
+                raise Reject(400, f"model {name}: only {', '.join(cat.only.values())} are enabled "
+                                  "(start the proxy with --any-model for the full Copilot catalog)")
+            payload["model"] = cat.resolve_model(name)
         stream = bool(payload.get("stream"))
         agent, vision = openai_flags(payload)
-        if not self._guard(f"POST {upstream} model={payload.get('model')} stream={stream}", False):
-            return
-        t0 = time.time()
+        self._guard(f"POST {upstream} model={payload.get('model')} stream={stream}")
+        started = time.monotonic()
         log = dict(route=upstream.strip("/"), model=payload.get("model"), stream=stream,
                    initiator="agent" if agent else "user")
-        conn = None
-        try:
-            conn, resp = self._copilot(upstream, payload, agent, vision)
-            if resp.status != 200 or not stream:
-                raw = resp.read()
-                usage = openai_usage(_dict_get(_json_or_none(raw), "usage"))
-                self.server.usage.record(**log, status=resp.status, usage=usage, ms=int((time.time() - t0) * 1000))
-                self._send_raw(resp.status, raw, resp.getheader("Content-Type", "application/json; charset=utf-8"),
-                               extra=self._passthrough_headers(resp) if resp.status != 200 else None)
-                return
-            self._begin_sse()
-            usage = {}
-            while True:
-                line = resp.readline()
-                if not line:
-                    break
-                self._chunk(line)
-                if line.startswith(b"data:") and b'"usage"' in line:
-                    ev = _json_or_none(line[5:].strip())
-                    u = _dict_get(ev, "usage") or _dict_get(_dict_get(ev, "response"), "usage")
-                    if u:
-                        usage = openai_usage(u)  # chat: last chunk; responses: response.completed
-            self._end_chunks()
-            self.server.usage.record(**log, status=200, usage=usage, ms=int((time.time() - t0) * 1000))
-        except (BrokenPipeError, ConnectionResetError) as exc:
-            self._conn_error(exc)
-        except Exception as exc:
-            LOG.exception("%s failed", upstream)
-            self._fail(502, str(exc), anthropic=False)
-        finally:
-            if conn is not None:
-                conn.close()
-
-    def _passthrough(self, upstream: str) -> None:
-        payload = self._read_json(anthropic=False)
-        if payload is None or not self._guard(f"POST {upstream} model={payload.get('model')}", False):
+        up = self._copilot(upstream, payload, agent, vision)
+        if up.status != 200 or not stream:
+            raw = up.body()
+            self._record(log, started, up.status, openai_usage(_dict_get(_json_object(raw), "usage")))
+            self._send_raw(up.status, raw, up.header("Content-Type", JSON_TYPE),
+                           self._passthrough_headers(up) if up.status != 200 else None)
             return
-        conn = None
-        try:
-            conn, resp = self._copilot(upstream, payload, False, False)
-            self._send_raw(resp.status, resp.read(), resp.getheader("Content-Type", "application/json; charset=utf-8"))
-        except Exception as exc:
-            self._fail(502, str(exc), anthropic=False)
-        finally:
-            if conn is not None:
-                conn.close()
+        usage: dict[str, int] = {}
+
+        def scan(ev: dict[str, Any]) -> None:
+            u = _dict_get(ev, "usage") or _dict_get(_dict_get(ev, "response"), "usage")
+            if u:  # chat: the last chunk; responses: response.completed
+                usage.clear()
+                usage.update(openai_usage(u))
+
+        self._relay(up, scan)
+        self._record(log, started, 200, usage)
+
+    def _embeddings(self) -> None:
+        self._anthropic = False
+        payload = self._read_json()
+        self._guard(f"POST /embeddings model={payload.get('model')}")
+        up = self._copilot("/embeddings", payload)
+        self._send_raw(up.status, up.body(), up.header("Content-Type", JSON_TYPE))
 
 
 # ---------------------------------------------------------------------------
@@ -2081,15 +2248,17 @@ def self_sandbox_profile(args: argparse.Namespace) -> str:
         while cur.startswith(home + "/"):
             ancestors.add(cur)
             cur = os.path.dirname(cur)
-    sub = lambda ps: " ".join(f"(subpath {_sb_quote(p)})" for p in sorted(ps))
-    lit = lambda ps: " ".join(f"(literal {_sb_quote(p)})" for p in sorted(ps))
+
+    def sub(paths: set[str]) -> str:
+        return " ".join(f"(subpath {_sb_quote(p)})" for p in sorted(paths))
+
     return "\n".join([
         "(version 1)",
         "(allow default)",
         f"(deny file-read* file-write* (subpath {_sb_quote(home)}))",
         f"(allow file-read* file-read-metadata {sub(read | rw)})",
         f"(allow file-write* {sub(rw)})",
-        f"(allow file-read-metadata {lit(ancestors)})",
+        "(allow file-read-metadata " + " ".join(f"(literal {_sb_quote(p)})" for p in sorted(ancestors)) + ")",
         # the proxy starts no programs: only the interpreter (a framework build re-executes inside its prefix)
         "(deny process-exec*)",
         f"(allow process-exec* (literal {_sb_quote(python)}) {sub(prefixes)})",
@@ -2156,46 +2325,14 @@ def cmd_check_usage(args: argparse.Namespace) -> None:
         print(json.dumps(data, indent=2))
 
 
-def cmd_start(args: argparse.Namespace) -> None:
-    if args.context_edit not in CONTEXT_EDIT_MODES:  # an env default is not checked by argparse
-        raise SystemExit(f"--context-edit / COPILOT_PROXY_CONTEXT_EDIT must be one of {', '.join(CONTEXT_EDIT_MODES)}")
-    if args.unix_socket and not hasattr(socketserver, "UnixStreamServer"):
-        raise SystemExit("--unix-socket is not available on this platform")
-    if args.sandbox_self:
-        reexec_sandboxed(args)  # does not return unless already inside the sandbox
-    elif os.environ.get("COPILOT_PROXY_SANDBOXED") == "1" and not _home_unreadable():
-        os.environ.pop("COPILOT_PROXY_SANDBOXED")  # a stray variable must not make the banner claim a sandbox
-    auth = args.auth_token
-    if auth == "auto":
-        auth = secrets.token_urlsafe(24)
-    tm = TokenManager(resolve_github_token(args), account_type=args.account_type, show_token=args.show_token)
-    tm.start_background_refresh()
-    catalog = ModelCatalog(tm, primary=args.model, small=args.small_model, any_model=args.any_model)
-    catalog.get_models_payload(force=True)
-    ids = catalog.chat_model_ids()
-    guard = RequestGuard(args.rate_limit, args.wait, args.manual)
-    kw = dict(mode=args.mode, count_mode=args.count_tokens, usage=UsageLog(args.usage_log))
-    if args.unix_socket:
-        server: Any = UnixProxyServer(args.unix_socket, tm, catalog, guard, args.show_token, **kw)
-        sock = str(server.socket_path)
-        base = "http://localhost"
-    else:
-        server = ProxyServer((args.host, args.port), tm, catalog, guard, args.show_token, **kw)
-        sock = None
-        shown = f"[{args.host}]" if ":" in args.host and not args.host.startswith("[") else args.host
-        base = f"http://{shown}:{args.port}"
-    server.cors_origins = set(args.cors_origin or [])
-    server.allowed_hosts |= {h for h in (host_name(a) for a in (args.allow_host or [])) if h}
-    server.auth_token = auth or None
-    server.context_edit = args.context_edit
-    if not server.check_host and not sock:
-        LOG.warning("Bound to %s: any Host is accepted and anyone who can reach this port uses your Copilot account",
-                    args.host)
-
+def print_banner(args: argparse.Namespace, tm: TokenManager, catalog: ModelCatalog, base: str,
+                 sock: Optional[str], auth: Optional[str]) -> None:
+    """What the proxy listens on and how it is set up; with -c, the Claude Code settings to use it."""
     print(f"\nCopilot proxy listening on {'unix socket ' + sock if sock else base}"
           + (" (inside macOS sandbox-exec)" if os.environ.get("COPILOT_PROXY_SANDBOXED") == "1" else ""))
     via = upstream_proxy("https", urllib.parse.urlsplit(tm.api_base_url).hostname or "")
     print(f"Upstream: {tm.api_base_url}" + (f" via HTTP proxy {via[0]}:{via[1]}" if via else ""))
+    ids = catalog.chat_model_ids()
     native = [m for m in ids if catalog.supports_endpoint(m, "/v1/messages")]
     print(f"Messages route: {args.mode} (native /v1/messages models: {', '.join(native) or 'none'}); "
           f"count_tokens: {args.count_tokens}; context editing: {args.context_edit}"
@@ -2235,6 +2372,44 @@ def cmd_start(args: argparse.Namespace) -> None:
         print("\nClient key (send as Authorization: Bearer or x-api-key):", auth)
     print("\nCtrl+C to stop.\n", flush=True)
 
+
+def cmd_start(args: argparse.Namespace) -> None:
+    if args.context_edit not in CONTEXT_EDIT_MODES:  # an env default is not checked by argparse
+        raise SystemExit(f"--context-edit / COPILOT_PROXY_CONTEXT_EDIT must be one of {', '.join(CONTEXT_EDIT_MODES)}")
+    if args.unix_socket and not hasattr(socketserver, "UnixStreamServer"):
+        raise SystemExit("--unix-socket is not available on this platform")
+    if args.sandbox_self:
+        reexec_sandboxed(args)  # does not return unless already inside the sandbox
+    elif os.environ.get("COPILOT_PROXY_SANDBOXED") == "1" and not _home_unreadable():
+        os.environ.pop("COPILOT_PROXY_SANDBOXED")  # a stray variable must not make the banner claim a sandbox
+    auth = secrets.token_urlsafe(24) if args.auth_token == "auto" else (args.auth_token or None)
+    tm = TokenManager(resolve_github_token(args), account_type=args.account_type, show_token=args.show_token)
+    tm.start_background_refresh()
+    catalog = ModelCatalog(tm, primary=args.model, small=args.small_model, any_model=args.any_model)
+    catalog.refresh(0.0)  # a failure is logged; the list is fetched again when a request needs it
+    guard = RequestGuard(args.rate_limit, args.wait, args.manual)
+    kw = dict(mode=args.mode, count_mode=args.count_tokens, usage=UsageLog(args.usage_log))
+    if args.unix_socket:
+        server: Any = UnixProxyServer(args.unix_socket, tm, catalog, guard, args.show_token, **kw)
+        sock: Optional[str] = str(server.socket_path)
+        base = "http://localhost"
+    else:
+        try:
+            server = ProxyServer((args.host, args.port), tm, catalog, guard, args.show_token, **kw)
+        except OSError as exc:
+            raise SystemExit(f"copilot_proxy: cannot listen on {args.host}:{args.port}: {exc}")
+        sock = None
+        shown = f"[{args.host}]" if ":" in args.host and not args.host.startswith("[") else args.host
+        base = f"http://{shown}:{args.port}"
+    server.cors_origins = set(args.cors_origin or [])
+    server.allowed_hosts |= {h for h in (host_name(a) for a in (args.allow_host or [])) if h}
+    server.auth_token = auth
+    server.context_edit = args.context_edit
+    if not server.check_host and not sock:
+        LOG.warning("Bound to %s: any Host is accepted and anyone who can reach this port uses your Copilot account",
+                    args.host)
+    print_banner(args, tm, catalog, base, sock, auth)
+
     def on_term(signum: int, frame: Any) -> None:
         raise KeyboardInterrupt  # same clean shutdown as Ctrl+C (removes the Unix socket)
     signal.signal(signal.SIGTERM, on_term)
@@ -2245,6 +2420,7 @@ def cmd_start(args: argparse.Namespace) -> None:
     finally:
         tm.stop()
         server.server_close()
+        UPSTREAM.clear()
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -2327,7 +2503,11 @@ def main() -> None:
     args = build_parser().parse_args()
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
                         format="%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S")
-    args.func(args)
+    try:
+        args.func(args)
+    except (UpstreamError, OSError) as exc:  # no network, login refused, port in use: one line, no traceback
+        LOG.debug("failed", exc_info=True)
+        raise SystemExit(f"copilot_proxy: {exc}")
 
 
 if __name__ == "__main__":
