@@ -584,6 +584,16 @@ class ModelCatalog:
         self._payload: dict[str, Any] = {"object": "list", "data": []}
         self._models: dict[str, dict[str, Any]] = {}
         self._fetched = 0.0
+        self._retry_at = 0.0
+
+    def ensure_loaded(self) -> None:
+        """Fetch the model list again when the last fetch failed (at most once a minute). Without it a network
+        error at startup would leave every request on the translated route, without the prompt cache."""
+        with self._lock:
+            if self._models or time.time() < self._retry_at:
+                return
+            self._retry_at = time.time() + 60
+        self._fetch()
 
     def get_models_payload(self, force: bool = False) -> dict[str, Any]:
         with self._lock:
@@ -1302,6 +1312,7 @@ class _ProxyConfig:
             return False
         if self.mode == "native":
             return True
+        self.catalog.ensure_loaded()
         return self.catalog.supports_endpoint(model, "/v1/messages")
 
 
@@ -1582,7 +1593,8 @@ class Handler(BaseHTTPRequestHandler):
         if ok:
             return True
         if retry is not None:
-            self._fail(429, f"Local rate limit. Retry after {retry:.1f}s.", anthropic)
+            self._fail(429, f"Local rate limit. Retry after {retry:.1f}s.", anthropic,
+                       extra={"Retry-After": str(max(1, int(retry + 0.999)))})
         else:
             self._fail(403, "Request rejected by manual approval.", anthropic)
         return False
@@ -1657,6 +1669,9 @@ class Handler(BaseHTTPRequestHandler):
         if not isinstance(payload.get("messages"), list):
             self._fail(400, "messages: must be a list")
             return
+        if not all(isinstance(m, dict) for m in payload["messages"]):
+            self._fail(400, "messages: every item must be an object")
+            return
         requested = str(payload.get("model", ""))
         cat = self.server.catalog
         model = cat.resolve_model(requested)
@@ -1666,7 +1681,11 @@ class Handler(BaseHTTPRequestHandler):
         if self.server.use_native(model) and self._messages_native(payload, requested, model, stream):
             return
         t0 = time.time()
-        oai, agent, vision = anthropic_to_openai_request(payload, model, cat.max_output_tokens(model))
+        try:
+            oai, agent, vision = anthropic_to_openai_request(payload, model, cat.max_output_tokens(model))
+        except (ValueError, TypeError, AttributeError) as exc:
+            self._fail(400, f"Invalid request: {exc}")
+            return
         LOG.info("messages: %s -> %s stream=%s initiator=%s vision=%s msgs=%d tools=%d", requested, model,
                  stream, "agent" if agent else "user", vision, len(oai["messages"]), len(oai.get("tools", [])))
         conn = None
@@ -1915,7 +1934,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def _passthrough(self, upstream: str) -> None:
         payload = self._read_json(anthropic=False)
-        if payload is None:
+        if payload is None or not self._guard(f"POST {upstream} model={payload.get('model')}", False):
             return
         conn = None
         try:

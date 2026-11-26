@@ -230,5 +230,10 @@ the environment also reaches the commands Claude Code runs; `CLAUDE_CODE_SUBPROC
 - Follow-up turns in a tool loop are sent with `X-Initiator: agent`, as copilot-api does. Fresh prompts, including
   a subagent's first prompt, are sent as `user`: the proxy never relabels a new prompt to avoid billing.
 
+## Tests
+`python3 test_offline.py` runs 21 checks against a fake Copilot upstream on 127.0.0.1: both message routes, streaming,
+tool calls, `count_tokens`, the initiator rule, the default model mapping, Host/Origin/key checks, malformed
+requests, the local rate limit and the model-list reload. It needs no network, login or Copilot quota.
+
 ## License
 MIT. See `LICENSE`.
